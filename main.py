@@ -623,27 +623,103 @@ def monitorar_trades():
     for trade in abertos:
         tid, ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, resultado, criado = trade
         symbol = ativo.lower().replace("/", "_").replace("-", "_")
-        candles = buscar_candles(symbol, "kline_5min", 5)
+        candles = buscar_candles(symbol, "minute5", 5)
         if not candles:
             continue
 
-        preco = float(candles[-1][4])
+        parsed = [parse_candle(c) for c in candles]
+        parsed = [p for p in parsed if p is not None]
+        if not parsed:
+            continue
+
+        preco = parsed[-1]["c"]
+        high  = parsed[-1]["h"]
+        low   = parsed[-1]["l"]
         tol   = entrada * TOLERANCIA_PCT
 
-        if direcao == "LONG" and abs(preco - entrada) <= tol:
-            enviar_telegram(
-                f"🟢 <b>ENTRADA LONG — {ativo}</b>\n"
-                f"💲 Preço: ${preco:.6g}\n"
-                f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
-                f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
-            )
-        elif direcao == "SHORT" and abs(preco - entrada) <= tol:
-            enviar_telegram(
-                f"🔴 <b>ENTRADA SHORT — {ativo}</b>\n"
-                f"💲 Preço: ${preco:.6g}\n"
-                f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
-                f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
-            )
+        if direcao == "LONG":
+            # Entrada acionada
+            if abs(preco - entrada) <= tol:
+                enviar_telegram(
+                    f"🟢 <b>ENTRADA LONG — {ativo}</b>\n"
+                    f"💲 Preço: ${preco:.6g}\n"
+                    f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                    f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
+                )
+            # A1 atingido
+            elif high >= a1:
+                enviar_telegram(
+                    f"🎯 <b>A1 ATINGIDO — {ativo} LONG #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
+                    f"✅ Realizar 25% da posição\n"
+                    f"🔒 Mover Stop para entrada ${entrada} (breakeven)\n"
+                    f"⏳ Aguardar A2: ${a2}"
+                )
+            # A2 atingido
+            elif high >= a2:
+                enviar_telegram(
+                    f"🎯 <b>A2 ATINGIDO — {ativo} LONG #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
+                    f"✅ Realizar 50% da posição\n"
+                    f"⏳ Aguardar A3: ${a3}"
+                )
+            # A3 atingido
+            elif high >= a3:
+                enviar_telegram(
+                    f"🏆 <b>A3 ATINGIDO — {ativo} LONG #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
+                    f"✅ Realizar 80% da posição\n"
+                    f"🎉 Trailing Stop ativo no restante!"
+                )
+            # Stop atingido
+            elif low <= stop:
+                enviar_telegram(
+                    f"🛑 <b>STOP ATINGIDO — {ativo} LONG #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
+                    f"❌ Sair da posição imediatamente!"
+                )
+
+        elif direcao == "SHORT":
+            # Entrada acionada
+            if abs(preco - entrada) <= tol:
+                enviar_telegram(
+                    f"🔴 <b>ENTRADA SHORT — {ativo}</b>\n"
+                    f"💲 Preço: ${preco:.6g}\n"
+                    f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                    f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
+                )
+            # A1 atingido
+            elif low <= a1:
+                enviar_telegram(
+                    f"🎯 <b>A1 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
+                    f"✅ Realizar 25% da posição\n"
+                    f"🔒 Mover Stop para entrada ${entrada} (breakeven)\n"
+                    f"⏳ Aguardar A2: ${a2}"
+                )
+            # A2 atingido
+            elif low <= a2:
+                enviar_telegram(
+                    f"🎯 <b>A2 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
+                    f"✅ Realizar 50% da posição\n"
+                    f"⏳ Aguardar A3: ${a3}"
+                )
+            # A3 atingido
+            elif low <= a3:
+                enviar_telegram(
+                    f"🏆 <b>A3 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
+                    f"✅ Realizar 80% da posição\n"
+                    f"🎉 Trailing Stop ativo no restante!"
+                )
+            # Stop atingido
+            elif high >= stop:
+                enviar_telegram(
+                    f"🛑 <b>STOP ATINGIDO — {ativo} SHORT #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
+                    f"❌ Sair da posição imediatamente!"
+                )
 
 # ─────────────────────────────────────────────
 # COMANDOS DO TELEGRAM
@@ -739,6 +815,60 @@ def processar_comando(texto):
 # ─────────────────────────────────────────────
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────────
+def relatorio_diario():
+    """Relatório automático diário às 18h BRT."""
+    brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
+    total, wins, loss, abertos, wr = relatorio()
+
+    # Calcular P&L fictício (risco 2% por trade = $20 em $1000)
+    risco_por_trade = CAPITAL_INICIAL * 0.02
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("SELECT resultado FROM trades WHERE DATE(criado_em) = DATE('now')")
+    hoje = c.fetchall()
+    conn.close()
+
+    pnl = 0
+    wins_hoje  = 0
+    loss_hoje  = 0
+    for r in hoje:
+        res = r[0] or ""
+        if "WIN_A1" in res:
+            pnl += risco_por_trade * 1.0
+            wins_hoje += 1
+        elif "WIN_A2" in res:
+            pnl += risco_por_trade * 2.0
+            wins_hoje += 1
+        elif "WIN_A3" in res:
+            pnl += risco_por_trade * 3.0
+            wins_hoje += 1
+        elif res == "LOSS":
+            pnl -= risco_por_trade
+            loss_hoje += 1
+
+    sinal_pnl = "+" if pnl >= 0 else ""
+    emoji_pnl = "📈" if pnl >= 0 else "📉"
+
+    msg = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>RELATÓRIO DIÁRIO — LucSharkTrade</b>\n"
+        f"📅 {brt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"<b>HOJE</b>\n"
+        f"✅ Wins: {wins_hoje} | ❌ Losses: {loss_hoje}\n"
+        f"{emoji_pnl} P&L: {sinal_pnl}${pnl:.2f}\n"
+        f"\n"
+        f"<b>ACUMULADO</b>\n"
+        f"Total trades: {total}\n"
+        f"✅ Wins: {wins} | ❌ Losses: {loss} | 🔄 Abertos: {abertos}\n"
+        f"🎯 Win Rate: {wr:.1f}%\n"
+        f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    enviar_telegram(msg)
+    log.info("Relatório diário enviado.")
+
 def main():
     init_db()
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
@@ -769,6 +899,12 @@ def main():
                     enviar_telegram(resposta)
 
         monitorar_trades()
+
+        # Relatório diário automático às 18h BRT
+        agora_brt = brt_agora()
+        if agora_brt.hour == 18 and agora_brt.minute == 0:
+            relatorio_diario()
+            time.sleep(60)  # evitar duplo envio no mesmo minuto
 
         time.sleep(INTERVALO_SEG)
 
