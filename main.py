@@ -163,53 +163,68 @@ def extrair_volume(ticker_data):
             pass
     return 0
 
-# LBank official timeframe values (from API docs)
+# LBank timeframe map (ccxt standard)
 LBANK_TF_MAP = {
-    "minute15":    "minute15",
-    "minute5":     "minute5",
-    "minute1":     "minute1",
-    "minute30":    "minute30",
-    "hour1":       "hour1",
-    "hour4":       "hour4",
-    "day1":        "day1",
-    # legacy aliases
-    "kline_15min": "minute15",
-    "kline_5min":  "minute5",
-    "kline_1h":    "hour1",
+    "minute15":    "15m",
+    "minute5":     "5m",
+    "minute1":     "1m",
+    "minute30":    "30m",
+    "hour1":       "1h",
+    "hour4":       "4h",
+    "day1":        "1d",
+    "kline_15min": "15m",
+    "kline_5min":  "5m",
+    "kline_1h":    "1h",
+    # already ccxt format
+    "15m": "15m", "5m": "5m", "1h": "1h",
 }
+
+# Global ccxt exchange instance
+try:
+    import ccxt as _ccxt
+    _exchange = _ccxt.lbank({"enableRateLimit": True})
+    _exchange.load_markets()
+    CCXT_AVAILABLE = True
+    log.info("ccxt LBank carregado com sucesso")
+except Exception as e:
+    CCXT_AVAILABLE = False
+    log.warning(f"ccxt indisponivel: {e}")
 
 def buscar_candles(symbol, tf=None, tamanho=50):
     """
-    LBank v1 kline endpoint (official).
-    Required params: symbol, size, type, time (unix seconds)
-    Returns: [[timestamp, open, high, low, close, volume], ...]
+    Busca candles via ccxt (biblioteca testada e mantida).
+    Retorna: [[timestamp, open, high, low, close, volume], ...]
     """
-    raw_tf    = tf or TIMEFRAME_SCAN
-    timeframe = LBANK_TF_MAP.get(raw_tf, raw_tf)
-    ts_now    = int(time.time())  # unix timestamp in seconds (required)
+    raw_tf   = tf or TIMEFRAME_SCAN
+    ccxt_tf  = LBANK_TF_MAP.get(raw_tf, "15m")
+    # Normalizar symbol para formato ccxt: btc_usdt -> BTC/USDT
+    sym_upper = symbol.upper().replace("_", "/")
+
+    if CCXT_AVAILABLE:
+        try:
+            ohlcv = _exchange.fetch_ohlcv(sym_upper, ccxt_tf, limit=tamanho)
+            # ccxt returns [[ts_ms, o, h, l, c, v], ...]
+            # Convert to [ts_sec, o, h, l, c, v]
+            return [[c[0]//1000, c[1], c[2], c[3], c[4], c[5]] for c in ohlcv if c]
+        except Exception as e:
+            log.debug(f"ccxt {symbol}: {e}")
+
+    # Fallback: requests direto com parametros corretos
     try:
-        r = requests.get(
-            "https://api.lbkex.com/v1/kline.do",
-            params={
-                "symbol": symbol.lower(),
-                "size":   tamanho,
-                "type":   timeframe,
-                "time":   ts_now
-            },
-            timeout=10
-        )
+        ts_sec = int(time.time())
+        r = requests.get("https://api.lbank.info/v2/kline.do", params={
+            "symbol": symbol.lower(),
+            "size":   tamanho,
+            "type":   raw_tf if raw_tf in ["minute15","minute5","hour1"] else "minute15",
+            "time":   ts_sec
+        }, timeout=10)
         dados = r.json()
-        # v1 returns list directly
-        if isinstance(dados, list) and len(dados) > 0:
+        if isinstance(dados, dict) and dados.get("result") in ("true", True):
+            return dados.get("data", [])
+        if isinstance(dados, list):
             return dados
-        # v2 wrapper fallback
-        if isinstance(dados, dict):
-            result = dados.get("result")
-            if result in ("true", True):
-                return dados.get("data", [])
-        log.debug(f"Candles {symbol}: {str(dados)[:80]}")
     except Exception as e:
-        log.error(f"Candles {symbol}: {e}")
+        log.error(f"Candles fallback {symbol}: {e}")
     return []
 
 # ─────────────────────────────────────────────
