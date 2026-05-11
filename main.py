@@ -444,11 +444,16 @@ def rodar_scanner_debug():
 
 def rodar_scanner():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
-    enviar_telegram(f"🔍 <b>SCANNER LucSharkTrade</b>\n{brt}\nAnalisando {brt}... Aguarde os sinais.")
+    enviar_telegram(
+        f"🔍 <b>SCANNER LucSharkTrade</b>\n"
+        f"{brt} | TF: 15M\n"
+        f"Analisando ativos... Aguarde."
+    )
 
-    tickers  = buscar_ticker_24h()
+    tickers   = buscar_ticker_24h()
     pares_raw = buscar_todos_pares()
 
+    # Filtrar por volume mínimo
     pares = []
     for p in pares_raw:
         t = tickers.get(p)
@@ -457,63 +462,157 @@ def rodar_scanner():
             if vol == 0 or vol >= MIN_VOLUME_24H:
                 pares.append(p)
         else:
-            pares.append(p)  # incluir se ticker indisponível
-
-    # Limitar para não sobrecarregar a API
+            pares.append(p)
     pares = pares[:600]
 
-    log.info(f"{len(pares)} ativos com volume suficiente.")
-    fortes, medios, alertas = [], [], []
+    log.info(f"Analisando {len(pares)} ativos...")
+
+    prioridade_max = []  # vol > 10x
+    alta_prioridade = [] # vol 5-10x
 
     for symbol in pares:
         try:
             candles = buscar_candles(symbol)
             if not candles:
                 continue
-            r = analisar_ativo(symbol, candles)
-            if r:
-                f = r["forca_max"]
-                if f == "FORTE":
-                    fortes.append(r)
-                elif f == "MÉDIO":
-                    medios.append(r)
-                else:
-                    alertas.append(r)
+
+            parsed = [parse_candle(c) for c in candles]
+            parsed = [p for p in parsed if p is not None]
+            if len(parsed) < 20:
+                continue
+
+            closes  = [p["c"] for p in parsed]
+            volumes = [p["v"] for p in parsed]
+
+            # Volume relativo
+            vol_rel = volume_relativo(volumes)
+
+            # Filtro principal: apenas vol >= 5x
+            if vol_rel < 5.0:
+                continue
+
+            # RSI
+            rsi = calcular_rsi(closes)
+
+            # Filtro RSI: apenas extremos
+            # LONG: RSI < 40 + volume alto
+            # SHORT: RSI > 60 + volume alto
+            if rsi >= 40 and rsi <= 60:
+                continue  # RSI neutro = ignorar
+
+            # Determinar viés
+            if rsi < 40:
+                vies = "LONG"
+                vies_emoji = "🟢"
+            else:
+                vies = "SHORT"
+                vies_emoji = "🔴"
+
+            # VWAP e suporte/resistência
+            vwap     = calcular_vwap(parsed[-20:])
+            suporte  = round(min(p["l"] for p in parsed[-5:]), 6)
+            resist   = round(max(p["h"] for p in parsed[-5:]), 6)
+            preco    = closes[-1]
+
+            resultado = {
+                "symbol":   symbol.upper(),
+                "preco":    preco,
+                "vol_rel":  vol_rel,
+                "rsi":      rsi,
+                "vwap":     round(vwap, 6),
+                "suporte":  suporte,
+                "resist":   resist,
+                "vies":     vies,
+                "vies_emoji": vies_emoji
+            }
+
+            if vol_rel >= 10.0:
+                prioridade_max.append(resultado)
+            else:
+                alta_prioridade.append(resultado)
+
             time.sleep(0.15)
+
         except Exception as e:
             log.error(f"Erro {symbol}: {e}")
 
-    for r in fortes:
-        enviar_telegram(formatar_sinal(r))
-        time.sleep(1)
+    # Ordenar por volume relativo (maior primeiro)
+    prioridade_max.sort(key=lambda x: x["vol_rel"], reverse=True)
+    alta_prioridade.sort(key=lambda x: x["vol_rel"], reverse=True)
 
-    for r in medios:
-        enviar_telegram(formatar_sinal(r))
-        time.sleep(1)
+    total = len(prioridade_max) + len(alta_prioridade)
 
-    if alertas:
-        nomes = ", ".join(a["symbol"] for a in alertas[:25])
+    if total == 0:
         enviar_telegram(
-            f"⚠️ <b>ALERTAS — {len(alertas)} ativos</b>\n{brt}\n\n"
-            f"{nomes}\n\n"
-            f"Sinais iniciais detectados. Abra os gráficos para verificar."
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ <b>SCAN CONCLUÍDO</b>\n"
+            f"{brt}\n"
+            f"Nenhum ativo com Vol ≥5x e RSI extremo.\n"
+            f"Mercado sem oportunidades claras agora."
         )
+        return
 
-    enviar_telegram(
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ <b>SCAN CONCLUÍDO</b>\n"
-        f"{brt}\n"
-        f"Ativos analisados: {len(pares)}\n"
-        f"Sinais FORTES: {len(fortes)}\n"
-        f"Sinais MÉDIOS: {len(medios)}\n"
-        f"Alertas: {len(alertas)}\n"
-        f"Próximo scan em 60 min"
-    )
-    log.info(f"Scan concluído. F:{len(fortes)} M:{len(medios)} A:{len(alertas)}")
+    # Montar mensagem única consolidada ordenada por volume
+    linhas = [
+        f"━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>SCANNER LucSharkTrade</b>",
+        f"🕐 {brt}",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"",
+    ]
 
-# ─────────────────────────────────────────────
-# MONITORAMENTO DE TRADES
-# ─────────────────────────────────────────────
+    if prioridade_max:
+        linhas.append(f"🚨 <b>PRIORIDADE MÁXIMA — Vol &gt;10x</b>")
+        linhas.append("")
+        for i, r in enumerate(prioridade_max, 1):
+            linhas.append(
+                f"{i}. <b>{r['symbol']}</b> {r['vies_emoji']} {r['vies']}"
+                f" | Vol <b>{r['vol_rel']}x</b> | RSI {r['rsi']}"
+                f" | 💲{r['preco']:.6g}"
+            )
+        linhas.append("")
+
+    if alta_prioridade:
+        linhas.append(f"⚡ <b>ALTA PRIORIDADE — Vol 5–10x</b>")
+        linhas.append("")
+        for i, r in enumerate(alta_prioridade, 1):
+            linhas.append(
+                f"{i}. <b>{r['symbol']}</b> {r['vies_emoji']} {r['vies']}"
+                f" | Vol <b>{r['vol_rel']}x</b> | RSI {r['rsi']}"
+                f" | 💲{r['preco']:.6g}"
+            )
+        linhas.append("")
+
+    linhas += [
+        f"━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"Total analisados: {len(pares)}",
+        f"",
+        f"👁 Escolha o ativo e envie o print para análise!",
+    ]
+
+    # Telegram tem limite de 4096 chars — enviar em blocos se necessário
+    mensagem = "\n".join(linhas)
+    if len(mensagem) <= 4000:
+        enviar_telegram(mensagem)
+    else:
+        # Dividir em blocos
+        bloco = []
+        chars = 0
+        for linha in linhas:
+            if chars + len(linha) > 3800:
+                enviar_telegram("\n".join(bloco))
+                bloco = [linha]
+                chars = len(linha)
+                time.sleep(1)
+            else:
+                bloco.append(linha)
+                chars += len(linha)
+        if bloco:
+            enviar_telegram("\n".join(bloco))
+
+    log.info(f"Scan concluído. Max:{len(prioridade_max)} Alta:{len(alta_prioridade)}")
+
+
 def monitorar_trades():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -652,7 +751,6 @@ def main():
         f"Envie /ajuda para ver os comandos."
     )
 
-    ultimo_scan   = 0
     ultimo_offset = None
 
     while True:
@@ -671,10 +769,6 @@ def main():
                     enviar_telegram(resposta)
 
         monitorar_trades()
-
-        if time.time() - ultimo_scan >= INTERVALO_SCAN:
-            rodar_scanner()
-            ultimo_scan = time.time()
 
         time.sleep(INTERVALO_SEG)
 
