@@ -1,3 +1,5 @@
 flask==3.0.0
 requests==2.31.0
-pandas==2.1.0
+pandas==2.1.4
+numpy==1.26.4
+pycoingecko==3.1.0
