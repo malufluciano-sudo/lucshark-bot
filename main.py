@@ -17,7 +17,7 @@ INTERVALO_SCAN   = int(os.environ.get("INTERVALO_SCAN", "3600"))
 MIN_VOLUME_24H   = float(os.environ.get("MIN_VOLUME_24H", "100000"))
 
 # ── Parâmetros do scanner ──
-TIMEFRAME_SCAN     = "kline_15min"
+TIMEFRAME_SCAN     = "minute15"
 CANDLES_ANALISE    = 50
 MULT_FORTE         = 1.8
 MULT_MEDIO         = 1.3
@@ -163,21 +163,39 @@ def extrair_volume(ticker_data):
             pass
     return 0
 
+# LBank valid timeframes
+LBANK_TF_MAP = {
+    "kline_15min": "minute15",
+    "kline_5min":  "minute5",
+    "kline_1h":    "hour1",
+    "minute15":    "minute15",
+    "minute5":     "minute5",
+    "hour1":       "hour1",
+}
+
 def buscar_candles(symbol, tf=None, tamanho=50):
-    timeframe = tf or TIMEFRAME_SCAN
+    raw_tf    = tf or TIMEFRAME_SCAN
+    timeframe = LBANK_TF_MAP.get(raw_tf, raw_tf)
+    # LBank needs unix timestamp for 'time' param in some endpoints
+    # Use /v2/kline.do with correct params
     try:
         r = requests.get(f"{LBANK_BASE}/v2/kline.do", params={
-            "symbol": symbol, "size": tamanho, "type": timeframe
+            "symbol": symbol,
+            "size":   tamanho,
+            "type":   timeframe
         }, timeout=10)
         dados = r.json()
-        # LBank returns result as "true" string OR True bool
         result = dados.get("result")
         if result == "true" or result is True:
             data = dados.get("data", [])
-            return data
-        # Some endpoints return data directly
-        if isinstance(dados, list) and len(dados) > 0:
+            if data:
+                return data
+        # Some LBank endpoints wrap differently
+        if "data" in dados and isinstance(dados["data"], list):
+            return dados["data"]
+        if isinstance(dados, list):
             return dados
+        log.warning(f"Candles {symbol} resposta inesperada: {str(dados)[:100]}")
     except Exception as e:
         log.error(f"Candles {symbol}: {e}")
     return []
@@ -372,26 +390,24 @@ def rodar_scanner_debug():
 
     for symbol in amostra:
         try:
-            candles_raw = buscar_candles(symbol)
-            parsed = [parse_candle(c) for c in candles_raw]
-            parsed = [p for p in parsed if p is not None]
+            # Test raw API call
+            r = requests.get(f"{LBANK_BASE}/v2/kline.do", params={
+                "symbol": symbol, "size": 10, "type": "minute15"
+            }, timeout=10)
+            raw_text = r.text[:150]
+            dados = r.json()
+            result = dados.get("result")
+            data   = dados.get("data", [])
 
             ticker = tickers.get(symbol, {})
-            vol24 = extrair_volume(ticker)
+            vol24  = extrair_volume(ticker)
 
             msg.append(f"<b>{symbol.upper()}</b>")
-            msg.append(f"  Candles raw: {len(candles_raw)} | Parsed: {len(parsed)}")
+            msg.append(f"  result={result} | data_len={len(data)}")
             msg.append(f"  Vol24h: {vol24:,.0f}")
-
-            if parsed:
-                closes  = [p["c"] for p in parsed]
-                volumes = [p["v"] for p in parsed]
-                vol_rel = volume_relativo(volumes)
-                meanV   = sum(volumes[-20:]) / min(20, len(volumes))
-                stdV    = (sum((v - meanV)**2 for v in volumes[-20:]) / min(20, len(volumes)))**0.5
-                zscore  = (volumes[-1] - meanV) / stdV if stdV > 0 else 0
-                msg.append(f"  Close: {closes[-1]:.4f}")
-                msg.append(f"  Vol rel: {vol_rel:.2f}x | Z-Score: {zscore:.2f}")
+            msg.append(f"  Raw: {raw_text}")
+            if data:
+                msg.append(f"  1o candle: {str(data[0])[:80]}")
             msg.append("")
         except Exception as e:
             msg.append(f"{symbol}: ERRO {e}\n")
