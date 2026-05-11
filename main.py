@@ -1,533 +1,550 @@
-import os, sqlite3, time, requests, threading, logging
-import pandas as pd
-import numpy as np
+import os
+import time
+import requests
+import logging
+import sqlite3
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-log = logging.getLogger(__name__)
-
-# ── Config ────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# ─────────────────────────────────────────────
+# CONFIGURAÇÃO
+# ─────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CAPITAL_INICIAL  = float(os.environ.get("CAPITAL_INICIAL", "1000"))
 TOLERANCIA_PCT   = float(os.environ.get("TOLERANCIA_PCT", "0.005"))
-INTERVALO_MON    = int(os.environ.get("INTERVALO_MON", "120"))
+INTERVALO_SEG    = int(os.environ.get("INTERVALO_SEG", "120"))
 INTERVALO_SCAN   = int(os.environ.get("INTERVALO_SCAN", "3600"))
 MIN_VOLUME_24H   = float(os.environ.get("MIN_VOLUME_24H", "100000"))
-PORT             = int(os.environ.get("PORT", "8080"))
 
-BRT = timezone(timedelta(hours=-3))
-DB  = "/app/data/lucshark.db"
-os.makedirs("/app/data", exist_ok=True)
+# ── Parâmetros do scanner ──
+TIMEFRAME_SCAN     = "kline_15min"
+CANDLES_ANALISE    = 50
+MULT_FORTE         = 1.8
+MULT_MEDIO         = 1.3
+MULT_ALERTA        = 1.1
+MIN_CANDLES_RANGE  = 5
+RSI_SOBREVENDA     = 32
+RSI_SOBRECOMPRA    = 68
+OFFSET_BRT         = -3
 
-PRECO_MAP_CG = {
-    "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "BNBUSDT": "binancecoin",
-    "XRPUSDT": "ripple",  "SOLUSDT": "solana",   "LINKUSDT": "chainlink",
-    "LTCUSDT": "litecoin","HYPEUSDT":"hyperliquid","ASTRUSDT":"astar-network",
-    "XAGUSD":  "silver",  "XAUUSD":  "gold",
-}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-# ── Banco ─────────────────────────────────────────────────────
-conn = sqlite3.connect(DB, check_same_thread=False)
-cur  = conn.cursor()
-cur.executescript("""
-CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trade_id TEXT UNIQUE, data_hora TEXT, ativo TEXT, direcao TEXT,
-    tf_ctx TEXT DEFAULT "1H", tf_ent TEXT DEFAULT "5min",
-    entrada REAL, stop REAL, alvo1 REAL, alvo2 REAL, alvo3 REAL,
-    resultado TEXT DEFAULT "MONITORANDO",
-    preco_saida REAL DEFAULT 0, alerta_enviado INTEGER DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS scanner_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    data_hora TEXT, ativo TEXT, sinal TEXT, detalhes TEXT
-);
-CREATE TABLE IF NOT EXISTS ativos_lbank (
-    symbol TEXT PRIMARY KEY, vol24h REAL, ativo INTEGER DEFAULT 1,
-    ultima_atualizacao TEXT
-);
-""")
-conn.commit()
+# ─────────────────────────────────────────────
+# BANCO DE DADOS
+# ─────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ativo TEXT, direcao TEXT,
+            entrada REAL, stop REAL,
+            a1 REAL, a2 REAL, a3 REAL,
+            tf_ctx TEXT, tf_ent TEXT,
+            resultado TEXT DEFAULT 'ABERTO',
+            criado_em TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-estado = {
-    "ultimo_update_id": 0,
-    "trade_counter": cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0],
-    "monitorando": True,
-    "ultimo_scan": None,
-    "total_ativos": 0,
-    "ativos_scan": []
-}
+def salvar_trade(ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    agora = brt_agora().strftime("%Y-%m-%d %H:%M")
+    c.execute("""
+        INSERT INTO trades (ativo,direcao,entrada,stop,a1,a2,a3,tf_ctx,tf_ent,criado_em)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, agora))
+    conn.commit()
+    tid = c.lastrowid
+    conn.close()
+    return tid
 
-# ── Helpers ───────────────────────────────────────────────────
-def tg(msg):
+def atualizar_resultado(ativo, resultado):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("""
+        UPDATE trades SET resultado=?
+        WHERE ativo=? AND resultado='ABERTO'
+        ORDER BY id DESC LIMIT 1
+    """, (resultado, ativo.upper()))
+    conn.commit()
+    conn.close()
+
+def listar_trades():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 20")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def relatorio():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("SELECT resultado FROM trades")
+    todos = c.fetchall()
+    conn.close()
+    total   = len(todos)
+    wins    = sum(1 for r in todos if r[0] and r[0].startswith("WIN"))
+    loss    = sum(1 for r in todos if r[0] == "LOSS")
+    abertos = sum(1 for r in todos if r[0] == "ABERTO")
+    wr = (wins / (wins + loss) * 100) if (wins + loss) > 0 else 0
+    return total, wins, loss, abertos, wr
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def brt_agora():
+    return datetime.now(timezone(timedelta(hours=OFFSET_BRT)))
+
+def enviar_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram não configurado.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": str(msg)[:4000]},
-            timeout=10)
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
     except Exception as e:
-        log.error(f"TG: {e}")
+        log.error(f"Telegram erro: {e}")
 
-def get_preco_cg(symbol):
-    cg_id = PRECO_MAP_CG.get(symbol.upper())
-    if not cg_id: return None
+def get_updates(offset=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"timeout": 30, "offset": offset}
     try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": cg_id, "vs_currencies": "usd"}, timeout=8)
-        if r.status_code == 200:
-            return r.json().get(cg_id, {}).get("usd")
-    except: pass
-    return None
-
-def get_preco_lbank(symbol):
-    try:
-        r = requests.get("https://api.lbkex.com/v1/ticker.do",
-            params={"symbol": symbol}, timeout=8)
-        if r.status_code == 200:
-            v = float(r.json().get("ticker", {}).get("latest", 0))
-            return v if v > 0 else None
-    except: pass
-    return None
-
-def get_preco(symbol):
-    sym = symbol.upper().replace(".P","")
-    p = get_preco_cg(sym)
-    if p: return p
-    lb_sym = sym.lower().replace("usdt","_usdt").replace("usd","_usd") if "_" not in sym else sym.lower()
-    return get_preco_lbank(lb_sym)
-
-# ── Buscar TODOS os ativos da LBank ──────────────────────────
-def buscar_ativos_lbank():
-    log.info("Buscando todos os ativos da LBank...")
-    try:
-        # Buscar todos os pares
-        r = requests.get("https://api.lbkex.com/v1/currencyPairs.do", timeout=15)
-        if r.status_code != 200:
-            log.error(f"Erro ao buscar pares: {r.status_code}")
-            return []
-        todos_pares = r.json()
-        log.info(f"Total de pares encontrados: {len(todos_pares)}")
-
-        # Buscar ticker de todos para filtrar por volume
-        r2 = requests.get("https://api.lbkex.com/v1/ticker.do",
-            params={"symbol": "all"}, timeout=15)
-
-        pares_com_volume = []
-        if r2.status_code == 200:
-            tickers = r2.json()
-            for item in tickers:
-                symbol = item.get("symbol","")
-                try:
-                    vol = float(item.get("ticker",{}).get("vol",0))
-                    preco = float(item.get("ticker",{}).get("latest",0))
-                    if vol >= MIN_VOLUME_24H and preco > 0:
-                        pares_com_volume.append({"symbol": symbol, "vol24h": vol})
-                        cur.execute("""
-                            INSERT OR REPLACE INTO ativos_lbank (symbol, vol24h, ultima_atualizacao)
-                            VALUES (?,?,?)
-                        """, (symbol, vol, datetime.now(BRT).strftime("%d/%m/%Y %H:%M")))
-                except: continue
-            conn.commit()
-        else:
-            pares_com_volume = [{"symbol": p, "vol24h": 0} for p in todos_pares]
-
-        log.info(f"Ativos com volume > ${MIN_VOLUME_24H:,.0f}: {len(pares_com_volume)}")
-        return pares_com_volume
-
-    except Exception as e:
-        log.error(f"Erro buscar ativos: {e}")
+        r = requests.get(url, params=params, timeout=35)
+        return r.json().get("result", [])
+    except:
         return []
 
-# ── Candles e Indicadores ─────────────────────────────────────
-def get_klines(symbol, period, size=100):
+# ─────────────────────────────────────────────
+# LBANK API
+# ─────────────────────────────────────────────
+LBANK_BASE = "https://api.lbank.info"
+
+def buscar_todos_pares():
     try:
-        r = requests.get("https://api.lbkex.com/v1/kline.do",
-            params={"symbol":symbol,"size":size,"type":period}, timeout=10)
-        if r.status_code != 200: return None
-        data = r.json()
-        if not isinstance(data,list) or len(data)<20: return None
-        df = pd.DataFrame(data, columns=["timestamp","open","close","high","low","volume"])
-        for c in ["open","close","high","low","volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df.dropna()
-    except: return None
+        r = requests.get(f"{LBANK_BASE}/v2/currencyPairs.do", timeout=15)
+        dados = r.json()
+        if dados.get("result") == "true":
+            return dados.get("data", [])
+    except Exception as e:
+        log.error(f"Erro ao buscar pares: {e}")
+    return []
 
-def calcular(df):
-    if df is None or len(df)<20: return None
-    df = df.copy()
-    df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    d = df["close"].diff()
-    g = d.clip(lower=0).ewm(com=13, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(com=13, adjust=False).mean()
-    df["rsi"]     = 100-(100/(1+g/l))
-    df["vwap"]    = (df["close"]*df["volume"]).cumsum()/df["volume"].cumsum()
-    df["vol_med"] = df["volume"].rolling(20).mean()
-    df["vol_ratio"]= df["volume"]/df["vol_med"].replace(0, np.nan)
-    df["bb_mid"]  = df["close"].rolling(20).mean()
-    std = df["close"].rolling(20).std()
-    df["bb_up"]   = df["bb_mid"]+2*std
-    df["bb_dn"]   = df["bb_mid"]-2*std
-    h,lo,c = df["high"],df["low"],df["close"].shift(1)
-    tr = pd.concat([h-lo,(h-c).abs(),(lo-c).abs()],axis=1).max(axis=1)
-    df["atr"] = tr.ewm(com=13,adjust=False).mean()
-    return df
+def buscar_ticker_24h():
+    try:
+        r = requests.get(f"{LBANK_BASE}/v2/ticker/24hr.do?symbol=all", timeout=15)
+        dados = r.json()
+        if dados.get("result") == "true":
+            return {d["symbol"]: d for d in dados.get("data", [])}
+    except Exception as e:
+        log.error(f"Erro ticker 24h: {e}")
+    return {}
 
-# ── Scanner de sinais ─────────────────────────────────────────
-def analisar_ativo(symbol):
+def buscar_candles(symbol, tf=None, tamanho=50):
+    timeframe = tf or TIMEFRAME_SCAN
+    try:
+        r = requests.get(f"{LBANK_BASE}/v2/kline.do", params={
+            "symbol": symbol, "size": tamanho, "type": timeframe
+        }, timeout=10)
+        dados = r.json()
+        if dados.get("result") == "true":
+            return dados.get("data", [])
+    except Exception as e:
+        log.error(f"Candles {symbol}: {e}")
+    return []
+
+# ─────────────────────────────────────────────
+# INDICADORES
+# ─────────────────────────────────────────────
+def calcular_ema(valores, periodo):
+    if len(valores) < periodo:
+        return []
+    k = 2 / (periodo + 1)
+    emas = [sum(valores[:periodo]) / periodo]
+    for v in valores[periodo:]:
+        emas.append(v * k + emas[-1] * (1 - k))
+    return emas
+
+def calcular_rsi(closes, periodo=14):
+    if len(closes) < periodo + 1:
+        return 50
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    ganhos = [d if d > 0 else 0 for d in deltas]
+    perdas = [-d if d < 0 else 0 for d in deltas]
+    mg = sum(ganhos[:periodo]) / periodo
+    mp = sum(perdas[:periodo]) / periodo
+    for i in range(periodo, len(deltas)):
+        mg = (mg * (periodo - 1) + ganhos[i]) / periodo
+        mp = (mp * (periodo - 1) + perdas[i]) / periodo
+    if mp == 0:
+        return 100
+    return round(100 - (100 / (1 + mg / mp)), 2)
+
+def calcular_vwap(candles):
+    num = sum((float(c[2]) + float(c[3]) + float(c[4])) / 3 * float(c[5]) for c in candles)
+    den = sum(float(c[5]) for c in candles)
+    return num / den if den > 0 else 0
+
+def volume_relativo(volumes, n=20):
+    if len(volumes) < n + 1:
+        return 1.0
+    media = sum(volumes[-n-1:-1]) / n
+    return round(volumes[-1] / media, 2) if media > 0 else 1.0
+
+# ─────────────────────────────────────────────
+# ANÁLISE DE SINAL
+# ─────────────────────────────────────────────
+def analisar_ativo(symbol, candles):
+    if len(candles) < 25:
+        return None
+
+    highs   = [float(c[2]) for c in candles]
+    lows    = [float(c[3]) for c in candles]
+    closes  = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
+
+    preco  = closes[-1]
+    vol_rel = volume_relativo(volumes)
+    rsi    = calcular_rsi(closes)
+    vwap   = calcular_vwap(candles[-20:])
+    ema9   = calcular_ema(closes, 9)
+    ema21  = calcular_ema(closes, 21)
+
+    janela   = closes[-MIN_CANDLES_RANGE:]
+    suporte  = min(janela)
+    resist   = max(janela)
+
     sinais = []
-    try:
-        df1h = calcular(get_klines(symbol, "1hour", 100))
-        if df1h is None or len(df1h)<20: return []
 
-        u1  = df1h.iloc[-1]
-        p2  = df1h.iloc[-2]
-        preco   = float(u1["close"])
-        rsi1h   = float(u1["rsi"])
-        vol_r   = float(u1["vol_ratio"]) if not pd.isna(u1["vol_ratio"]) else 1.0
-        ema9    = float(u1["ema9"])
-        ema21   = float(u1["ema21"])
-        vwap    = float(u1["vwap"])
-        bb_up   = float(u1["bb_up"])
-        bb_dn   = float(u1["bb_dn"])
-        ema9_p  = float(p2["ema9"])
-        ema21_p = float(p2["ema21"])
-        rsi_p   = float(p2["rsi"])
+    # 1. Breakout de range
+    if vol_rel >= MULT_ALERTA:
+        if closes[-1] > resist:
+            forca = "FORTE" if vol_rel >= MULT_FORTE else "MÉDIO" if vol_rel >= MULT_MEDIO else "ALERTA"
+            sinais.append({"tipo": f"🚀 Breakout LONG [{forca}]", "forca": forca,
+                           "detalhe": f"Rompeu ${resist:.4f} | Vol {vol_rel}x"})
+        elif closes[-1] < suporte:
+            forca = "FORTE" if vol_rel >= MULT_FORTE else "MÉDIO" if vol_rel >= MULT_MEDIO else "ALERTA"
+            sinais.append({"tipo": f"📉 Breakout SHORT [{forca}]", "forca": forca,
+                           "detalhe": f"Rompeu ${suporte:.4f} | Vol {vol_rel}x"})
 
-        max20 = float(df1h["high"].tail(20).max())
-        min20 = float(df1h["low"].tail(20).min())
-        sym_up = symbol.replace("_usdt","usdt").replace("_usd","usd").upper()
+    # 2. Compressão de volatilidade (pré-Spring Wyckoff)
+    if len(closes) >= 15:
+        amp_rec = sum(highs[i] - lows[i] for i in range(-5, 0)) / 5
+        amp_ant = sum(highs[i] - lows[i] for i in range(-15, -5)) / 10
+        vol_rec = sum(volumes[-5:]) / 5
+        vol_ant = sum(volumes[-15:-5]) / 10
+        if amp_ant > 0 and amp_rec < amp_ant * 0.6 and vol_rec < vol_ant * 0.8:
+            sinais.append({"tipo": "⚡ Compressão [ALERTA]", "forca": "ALERTA",
+                           "detalhe": f"Volatilidade -{round((1-amp_rec/amp_ant)*100)}% | Vol caindo → Spring próximo"})
 
-        # SINAL 1: Tuk Tuk — rompimento com volume
-        if preco >= max20*0.998 and vol_r >= 1.5:
-            sinais.append({"tipo":"TUK TUK LONG","forca":"FORTE",
-                "desc":f"Rompeu maxima {max20:.6f} | Vol {vol_r:.1f}x",
-                "acao":"Aguardar pullback para LONG"})
+    # 3. Toque VWAP
+    if vwap > 0 and abs(preco - vwap) / vwap < 0.003 and vol_rel >= MULT_MEDIO:
+        direcao = "LONG" if preco > vwap else "SHORT"
+        forca = "MÉDIO" if vol_rel >= MULT_MEDIO else "ALERTA"
+        sinais.append({"tipo": f"📍 Toque VWAP {direcao} [{forca}]", "forca": forca,
+                       "detalhe": f"VWAP ${vwap:.4f} | Preço ${preco:.4f} | Vol {vol_rel}x"})
 
-        if preco <= min20*1.002 and vol_r >= 1.5:
-            sinais.append({"tipo":"TUK TUK SHORT","forca":"FORTE",
-                "desc":f"Rompeu minima {min20:.6f} | Vol {vol_r:.1f}x",
-                "acao":"Aguardar pullback para SHORT"})
+    # 4. RSI extremo com reversão
+    if rsi < RSI_SOBREVENDA and closes[-1] > closes[-2]:
+        sinais.append({"tipo": "🔄 RSI Reversão LONG [ALERTA]", "forca": "ALERTA",
+                       "detalhe": f"RSI {rsi} | Sobrevenda com vela de recuperação"})
+    elif rsi > RSI_SOBRECOMPRA and closes[-1] < closes[-2]:
+        sinais.append({"tipo": "🔄 RSI Reversão SHORT [ALERTA]", "forca": "ALERTA",
+                       "detalhe": f"RSI {rsi} | Sobrecompra com vela de rejeição"})
 
-        # SINAL 2: EMA Cross
-        if ema9_p < ema21_p and ema9 > ema21 and vol_r >= 1.2:
-            sinais.append({"tipo":"EMA CROSS LONG","forca":"MEDIA",
-                "desc":f"EMA9 cruzou EMA21 para cima | Vol {vol_r:.1f}x",
-                "acao":"Potencial LONG"})
+    # 5. Volume climático (possível Spring/Upthrust)
+    if vol_rel >= 3.0:
+        sinais.append({"tipo": "🌊 Volume Climático [FORTE]", "forca": "FORTE",
+                       "detalhe": f"Vol {vol_rel}x → possível Spring ou Upthrust Wyckoff"})
 
-        if ema9_p > ema21_p and ema9 < ema21 and vol_r >= 1.2:
-            sinais.append({"tipo":"EMA CROSS SHORT","forca":"MEDIA",
-                "desc":f"EMA9 cruzou EMA21 para baixo | Vol {vol_r:.1f}x",
-                "acao":"Potencial SHORT"})
+    # 6. EMA Cross
+    if len(ema9) >= 2 and len(ema21) >= 2:
+        if ema9[-2] <= ema21[-2] and ema9[-1] > ema21[-1] and vol_rel >= MULT_MEDIO:
+            sinais.append({"tipo": "✂️ EMA Cross LONG [MÉDIO]", "forca": "MÉDIO",
+                           "detalhe": f"EMA9 cruzou EMA21 para cima | Vol {vol_rel}x"})
+        elif ema9[-2] >= ema21[-2] and ema9[-1] < ema21[-1] and vol_rel >= MULT_MEDIO:
+            sinais.append({"tipo": "✂️ EMA Cross SHORT [MÉDIO]", "forca": "MÉDIO",
+                           "detalhe": f"EMA9 cruzou EMA21 para baixo | Vol {vol_rel}x"})
 
-        # SINAL 3: RSI extremo
-        if rsi1h <= 28 and rsi1h > rsi_p:
-            sinais.append({"tipo":"RSI SOBREVENDA","forca":"MEDIA",
-                "desc":f"RSI {rsi1h:.1f} revertendo para cima",
-                "acao":"Potencial LONG no 5min"})
+    if not sinais:
+        return None
 
-        if rsi1h >= 72 and rsi1h < rsi_p:
-            sinais.append({"tipo":"RSI SOBRECOMPRA","forca":"MEDIA",
-                "desc":f"RSI {rsi1h:.1f} revertendo para baixo",
-                "acao":"Potencial SHORT no 5min"})
+    ordem = {"FORTE": 3, "MÉDIO": 2, "ALERTA": 1}
+    forca_max = max(sinais, key=lambda s: ordem.get(s["forca"], 0))["forca"]
 
-        # SINAL 4: Toque VWAP
-        dist_vwap = abs(preco-vwap)/vwap if vwap > 0 else 1
-        if dist_vwap <= 0.003 and vol_r >= 1.2:
-            dir_vwap = "LONG" if preco >= vwap else "SHORT"
-            sinais.append({"tipo":f"TOQUE VWAP {dir_vwap}","forca":"MEDIA",
-                "desc":f"Preco {preco:.6f} tocando VWAP {vwap:.6f} | Vol {vol_r:.1f}x",
-                "acao":f"Potencial {dir_vwap}"})
+    return {
+        "symbol": symbol.upper(),
+        "preco": preco,
+        "vol_rel": vol_rel,
+        "rsi": rsi,
+        "vwap": round(vwap, 4),
+        "suporte": round(suporte, 4),
+        "resistencia": round(resist, 4),
+        "sinais": sinais,
+        "forca_max": forca_max
+    }
 
-        # SINAL 5: Volume climatico (Spring/Exaustao)
-        if vol_r >= 3.0 and rsi1h < 35:
-            sinais.append({"tipo":"VOLUME CLIMATICO BAIXA","forca":"FORTE",
-                "desc":f"Vol {vol_r:.1f}x | RSI {rsi1h:.1f} — possivel Spring Wyckoff",
-                "acao":"URGENTE: Possivel capitulacao/Spring"})
+# ─────────────────────────────────────────────
+# FORMATAÇÃO DE MENSAGEM
+# ─────────────────────────────────────────────
+def formatar_sinal(r):
+    brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
+    linhas = [
+        f"━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>SCANNER LucSharkTrade</b>",
+        f"🕐 {brt} | TF: 15M",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"<b>{r['symbol']}</b> | 💲{r['preco']:.6g}",
+        f"📈 Vol relativo: {r['vol_rel']}x",
+        f"📉 RSI: {r['rsi']} | VWAP: {r['vwap']}",
+        f"🟩 Sup: {r['suporte']} | 🟥 Res: {r['resistencia']}",
+        "",
+    ]
+    for s in r["sinais"]:
+        linhas.append(f"{s['tipo']}")
+        linhas.append(f"   └ {s['detalhe']}")
+    linhas += ["", "👁 <b>Abra o gráfico e envie o print para análise!</b>"]
+    return "\n".join(linhas)
 
-        if vol_r >= 3.0 and rsi1h > 65:
-            sinais.append({"tipo":"VOLUME CLIMATICO ALTA","forca":"FORTE",
-                "desc":f"Vol {vol_r:.1f}x | RSI {rsi1h:.1f} — possivel exaustao",
-                "acao":"URGENTE: Possivel exaustao compradora"})
-
-        # SINAL 6: Bollinger Squeeze (volatilidade comprimida)
-        bb_width = (bb_up - bb_dn) / float(u1["bb_mid"]) if float(u1["bb_mid"]) > 0 else 1
-        bb_hist  = [(float(df1h["bb_up"].iloc[i])-float(df1h["bb_dn"].iloc[i]))/float(df1h["bb_mid"].iloc[i])
-                    for i in range(-20,-1) if float(df1h["bb_mid"].iloc[i]) > 0]
-        if bb_hist and bb_width <= min(bb_hist)*1.1:
-            sinais.append({"tipo":"BOLLINGER SQUEEZE","forca":"MEDIA",
-                "desc":f"Volatilidade comprimida — movimento iminente",
-                "acao":"Monitorar rompimento com volume"})
-
-        for s in sinais:
-            s["ativo"] = sym_up
-            s["preco"] = preco
-            s["rsi"]   = round(rsi1h,1)
-            s["vol_r"] = round(vol_r,2)
-
-    except Exception as e:
-        log.debug(f"Scan [{symbol}]: {e}")
-    return sinais
-
-# ── Runner do scanner ─────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SCANNER PRINCIPAL
+# ─────────────────────────────────────────────
 def rodar_scanner():
-    log.info("Scanner iniciado!")
-    while True:
+    brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
+    enviar_telegram(f"🔍 <b>SCANNER LucSharkTrade</b>\n{brt}\nAnalisando {brt}... Aguarde os sinais.")
+
+    tickers  = buscar_ticker_24h()
+    pares_raw = buscar_todos_pares()
+
+    pares = []
+    for p in pares_raw:
+        t = tickers.get(p)
+        if t:
+            try:
+                if float(t.get("turnover", 0)) >= MIN_VOLUME_24H:
+                    pares.append(p)
+            except:
+                pass
+
+    log.info(f"{len(pares)} ativos com volume suficiente.")
+    fortes, medios, alertas = [], [], []
+
+    for symbol in pares:
         try:
-            agora = datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")
-            log.info(f"[{agora}] Buscando ativos da LBank...")
-
-            # Buscar todos os ativos com volume relevante
-            ativos = buscar_ativos_lbank()
-            if not ativos:
-                log.warning("Sem ativos — usando lista anterior")
-                ativos = [{"symbol":s} for s in estado["ativos_scan"]] if estado["ativos_scan"] else []
-
-            estado["ativos_scan"]  = [a["symbol"] for a in ativos]
-            estado["total_ativos"] = len(ativos)
-
-            tg(f"SCANNER LucSharkTrade\n{agora}\nAnalisando {len(ativos)} ativos...\nAguarde os sinais.")
-
-            todos_sinais = []
-            for i, ativo in enumerate(ativos):
-                symbol = ativo["symbol"]
-                sinais = analisar_ativo(symbol)
-                for s in sinais:
-                    todos_sinais.append(s)
-                    cur.execute("INSERT INTO scanner_log (data_hora,ativo,sinal,detalhes) VALUES (?,?,?,?)",
-                        (agora, s["ativo"], s["tipo"], s["desc"]))
-                conn.commit()
-                # Rate limit — pausa a cada 10 ativos
-                if (i+1) % 10 == 0:
-                    time.sleep(2)
-
-            # Separar por força
-            fortes = [s for s in todos_sinais if s["forca"]=="FORTE"]
-            medios = [s for s in todos_sinais if s["forca"]=="MEDIA"]
-
-            # Resumo
-            tg(f"SCAN CONCLUIDO\n{agora}\nAtivos analisados: {len(ativos)}\nSinais FORTES: {len(fortes)}\nSinais MEDIOS: {len(medios)}\nProximo scan em {INTERVALO_SCAN//60} min")
-
-            # Alertas fortes individualmente
-            for s in fortes:
-                tg(
-                    f"SINAL FORTE — {s['tipo']}\n"
-                    f"Ativo: {s['ativo']} | ${s['preco']:,.6f}\n"
-                    f"RSI: {s['rsi']} | Volume: {s['vol_r']}x\n"
-                    f"Detalhe: {s['desc']}\n"
-                    f"Acao: {s['acao']}\n"
-                    f"Envie o print para analise!"
-                )
-                time.sleep(1)
-
-            # Medios agrupados (max 10 por mensagem)
-            if medios:
-                chunks = [medios[i:i+10] for i in range(0,len(medios),10)]
-                for chunk in chunks:
-                    linhas = ["SINAIS MEDIOS:"]
-                    for s in chunk:
-                        linhas.append(f"• {s['ativo']}: {s['tipo']} | ${s['preco']:,.6f}")
-                    tg("\n".join(linhas))
-                    time.sleep(1)
-
-            estado["ultimo_scan"] = agora
-            log.info(f"Scan concluido: {len(todos_sinais)} sinais em {len(ativos)} ativos")
-            time.sleep(INTERVALO_SCAN)
-
-        except Exception as e:
-            log.error(f"Scanner: {e}")
-            time.sleep(60)
-
-# ── Monitor de trades ─────────────────────────────────────────
-def rr(entrada, stop, alvo, direcao):
-    try:
-        risco = abs(float(entrada)-float(stop))
-        lucro = abs(float(alvo)-float(entrada))
-        return round(lucro/risco,2) if risco>0 else 0
-    except: return 0
-
-def monitorar():
-    log.info("Monitor iniciado!")
-    while estado["monitorando"]:
-        try:
-            rows = cur.execute(
-                'SELECT trade_id,ativo,direcao,entrada,stop,alvo1,alvo2,alvo3,alerta_enviado '
-                'FROM trades WHERE resultado="MONITORANDO"'
-            ).fetchall()
-            log.info(f"Monitor: {len(rows)} trade(s)")
-            for tid,ativo,direcao,entrada,stop,a1,a2,a3,ja_alertou in rows:
-                entrada=float(entrada); stop=float(stop)
-                a1=float(a1); a2=float(a2); a3=float(a3)
-                preco = get_preco(ativo)
-                if not preco: continue
-                dist = abs(preco-entrada)/entrada
-                rr1=rr(entrada,stop,a1,direcao)
-                rr2=rr(entrada,stop,a2,direcao)
-                rr3=rr(entrada,stop,a3,direcao)
-                if dist<=TOLERANCIA_PCT and not ja_alertou:
-                    cur.execute("UPDATE trades SET alerta_enviado=1 WHERE trade_id=?",(tid,))
-                    conn.commit()
-                    tg(f"ALERTA DE ENTRADA\nID: {tid} | {ativo} {direcao}\nPreco: ${preco:,.6f} | Entrada: ${entrada:,.6f}\nDist: {dist*100:.2f}%\nStop: ${stop:,.6f}\nA1 (RR {rr1}:1): ${a1:,.6f} -> 25%\nA2 (RR {rr2}:1): ${a2:,.6f} -> 50%\nA3 (RR {rr3}:1): ${a3:,.6f} -> 80%\n/resultado {ativo} WIN A1 ou /resultado {ativo} LOSS")
-                    continue
-                if not ja_alertou: continue
-                stop_hit=(direcao=="LONG" and preco<=stop) or (direcao=="SHORT" and preco>=stop)
-                if stop_hit:
-                    cur.execute('UPDATE trades SET resultado="STOP",preco_saida=? WHERE trade_id=?',(preco,tid))
-                    conn.commit()
-                    tg(f"STOP ATINGIDO\nID: {tid} | {ativo} {direcao}\nEntrada: ${entrada:,.6f} | Saida: ${preco:,.6f}\n/resultado {ativo} LOSS")
-                    continue
-                for val,nome,pct in [(a1,"A1",25),(a2,"A2",50),(a3,"A3",80)]:
-                    hit=(direcao=="LONG" and preco>=val) or (direcao=="SHORT" and preco<=val)
-                    if hit:
-                        if nome=="A3":
-                            cur.execute('UPDATE trades SET resultado="WIN_A3",preco_saida=? WHERE trade_id=?',(preco,tid))
-                            conn.commit()
-                        tg(f"{nome} ATINGIDO!\nID: {tid} | {ativo} {direcao}\nPreco: ${preco:,.6f}\nRealizar {pct}%\n/resultado {ativo} WIN {nome}")
-                        break
-            time.sleep(INTERVALO_MON)
-        except Exception as e:
-            log.error(f"Monitor: {e}")
-            time.sleep(30)
-
-# ── Comandos ──────────────────────────────────────────────────
-def novo_tid():
-    estado["trade_counter"] += 1
-    return f"LS{estado['trade_counter']:04d}"
-
-def processar_cmd():
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-            params={"offset":estado["ultimo_update_id"]+1,"timeout":5}, timeout=10)
-        if r.status_code!=200: return
-        for upd in r.json().get("result",[]):
-            estado["ultimo_update_id"] = upd["update_id"]
-            txt = upd.get("message",{}).get("text","").strip()
-            if not txt: continue
-            p=txt.split(); cmd=p[0].lower()
-            log.info(f"CMD: {txt}")
-
-            if cmd=="/trade":
-                if len(p)<8:
-                    tg("Formato:\n/trade ATIVO DIR ENTRADA STOP A1 A2 A3\nEx: /trade BTCUSDT LONG 84000 82000 86000 88000 90000")
-                    continue
-                try:
-                    ativo=p[1].upper(); direcao=p[2].upper()
-                    entrada=float(p[3]); stop=float(p[4])
-                    a1=float(p[5]); a2=float(p[6]); a3=float(p[7])
-                    tf_ctx=p[8].upper() if len(p)>8 else "1H"
-                    tf_ent=p[9] if len(p)>9 else "5min"
-                    rr1=rr(entrada,stop,a1,direcao)
-                    if rr1<1.0:
-                        tg(f"Trade DESCARTADO! A1 RR {rr1}:1 (minimo 1:1).")
-                        continue
-                    tid=novo_tid()
-                    agora=datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")
-                    cur.execute("INSERT OR REPLACE INTO trades (trade_id,data_hora,ativo,direcao,tf_ctx,tf_ent,entrada,stop,alvo1,alvo2,alvo3) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (tid,agora,ativo,direcao,tf_ctx,tf_ent,entrada,stop,a1,a2,a3))
-                    conn.commit()
-                    preco=get_preco(ativo)
-                    ps=f"${preco:,.6f}" if preco else "Indisponivel"
-                    ds=f"{abs(preco-entrada)/entrada*100:.2f}%" if preco else "N/A"
-                    rr2=rr(entrada,stop,a2,direcao); rr3=rr(entrada,stop,a3,direcao)
-                    tg(f"TRADE CADASTRADO\nID: {tid} | {ativo} {direcao} | {tf_ctx}/{tf_ent}\nPreco: {ps} ({ds})\nEntrada: ${entrada:,.6f} | Stop: ${stop:,.6f}\nA1 (RR {rr1}:1): ${a1:,.6f}\nA2 (RR {rr2}:1): ${a2:,.6f}\nA3 (RR {rr3}:1): ${a3:,.6f}\nMonitorando a cada {INTERVALO_MON//60} min")
-                except Exception as e:
-                    tg(f"Erro: {e}")
-
-            elif cmd=="/scan":
-                tg("Iniciando scan manual...")
-                threading.Thread(target=rodar_scanner, daemon=True).start()
-
-            elif cmd=="/ativos":
-                total=cur.execute("SELECT COUNT(*) FROM ativos_lbank WHERE ativo=1").fetchone()[0]
-                top=cur.execute("SELECT symbol,vol24h FROM ativos_lbank ORDER BY vol24h DESC LIMIT 10").fetchall()
-                linhas=[f"Ativos monitorados: {total}","","Top 10 por volume:"]
-                for sym,vol in top:
-                    linhas.append(f"• {sym}: ${vol:,.0f}")
-                tg("\n".join(linhas))
-
-            elif cmd=="/trades":
-                rows=cur.execute("SELECT trade_id,ativo,direcao,entrada,resultado FROM trades ORDER BY id DESC LIMIT 15").fetchall()
-                if not rows: tg("Nenhum trade.")
+            candles = buscar_candles(symbol)
+            if not candles:
+                continue
+            r = analisar_ativo(symbol, candles)
+            if r:
+                f = r["forca_max"]
+                if f == "FORTE":
+                    fortes.append(r)
+                elif f == "MÉDIO":
+                    medios.append(r)
                 else:
-                    linhas=["Trades:"]
-                    for tid,ativo,direcao,entrada,res in rows:
-                        linhas.append(f"{tid} | {ativo} {direcao} ${float(entrada):,.4f} | {res}")
-                    tg("\n".join(linhas))
+                    alertas.append(r)
+            time.sleep(0.15)
+        except Exception as e:
+            log.error(f"Erro {symbol}: {e}")
 
-            elif cmd=="/cancelar" and len(p)>=2:
-                ativo=p[1].upper()
-                cur.execute('UPDATE trades SET resultado="CANCELADO" WHERE ativo=? AND resultado="MONITORANDO"',(ativo,))
-                conn.commit(); tg(f"{ativo}: cancelado.")
+    for r in fortes:
+        enviar_telegram(formatar_sinal(r))
+        time.sleep(1)
 
-            elif cmd=="/resultado" and len(p)>=3:
-                ativo=p[1].upper(); res=p[2].upper()
-                nivel=p[3].upper() if len(p)>=4 else ""
-                res_final=f"WIN_{nivel}" if res=="WIN" and nivel else res
-                cur.execute('UPDATE trades SET resultado=? WHERE ativo=? AND resultado="MONITORANDO"',(res_final,ativo))
-                conn.commit(); tg(f"{ativo}: {res_final} registrado!")
+    for r in medios:
+        enviar_telegram(formatar_sinal(r))
+        time.sleep(1)
 
-            elif cmd=="/relatorio":
-                total=cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-                wins=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado LIKE "WIN%"').fetchone()[0]
-                losses=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado IN ("STOP","LOSS")').fetchone()[0]
-                mon=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado="MONITORANDO"').fetchone()[0]
-                wr=wins/(wins+losses)*100 if (wins+losses)>0 else 0
-                sinais_hoje=cur.execute("SELECT COUNT(*) FROM scanner_log WHERE data_hora LIKE ?",
-                    (datetime.now(BRT).strftime("%d/%m/%Y")+"%",)).fetchone()[0]
-                tg(f"RELATORIO LucSharkTrade\n{datetime.now(BRT).strftime('%d/%m/%Y %H:%M BRT')}\nTotal: {total} | Wins: {wins} | Losses: {losses} | Monitor: {mon}\nWin Rate: {wr:.1f}%\nSinais hoje: {sinais_hoje}\nAtivos scanner: {estado['total_ativos']}")
+    if alertas:
+        nomes = ", ".join(a["symbol"] for a in alertas[:25])
+        enviar_telegram(
+            f"⚠️ <b>ALERTAS — {len(alertas)} ativos</b>\n{brt}\n\n"
+            f"{nomes}\n\n"
+            f"Sinais iniciais detectados. Abra os gráficos para verificar."
+        )
 
-            elif cmd=="/status":
-                mon=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado="MONITORANDO"').fetchone()[0]
-                total=cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-                tg(f"Status LucSharkTrade v10\nMonitorando: {mon} trades\nTotal: {total} trades\nAtivos scanner: {estado['total_ativos']}\nUltimo scan: {estado.get('ultimo_scan','Nunca')}\nProximo: {INTERVALO_SCAN//60} min\n{datetime.now(BRT).strftime('%d/%m/%Y %H:%M BRT')}")
+    enviar_telegram(
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ <b>SCAN CONCLUÍDO</b>\n"
+        f"{brt}\n"
+        f"Ativos analisados: {len(pares)}\n"
+        f"Sinais FORTES: {len(fortes)}\n"
+        f"Sinais MÉDIOS: {len(medios)}\n"
+        f"Alertas: {len(alertas)}\n"
+        f"Próximo scan em 60 min"
+    )
+    log.info(f"Scan concluído. F:{len(fortes)} M:{len(medios)} A:{len(alertas)}")
 
-            elif cmd=="/ajuda":
-                tg("Comandos LucSharkTrade v10:\n/trade ATIVO DIR ENTRADA STOP A1 A2 A3\n/scan — scanner manual agora\n/ativos — ver ativos monitorados\n/trades — ver trades\n/cancelar ATIVO\n/resultado ATIVO WIN A1\n/resultado ATIVO LOSS\n/relatorio\n/status\n/ajuda")
+# ─────────────────────────────────────────────
+# MONITORAMENTO DE TRADES
+# ─────────────────────────────────────────────
+def monitorar_trades():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades WHERE resultado='ABERTO'")
+    abertos = c.fetchall()
+    conn.close()
 
-    except Exception as e:
-        log.error(f"Cmd: {e}")
+    for trade in abertos:
+        tid, ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, resultado, criado = trade
+        symbol = ativo.lower().replace("/", "_").replace("-", "_")
+        candles = buscar_candles(symbol, "kline_5min", 5)
+        if not candles:
+            continue
 
-# ── Flask ─────────────────────────────────────────────────────
-app = Flask(__name__)
+        preco = float(candles[-1][4])
+        tol   = entrada * TOLERANCIA_PCT
 
-@app.route("/")
-def index():
-    mon=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado="MONITORANDO"').fetchone()[0]
-    total=cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    sinais=cur.execute("SELECT COUNT(*) FROM scanner_log").fetchone()[0]
-    return jsonify({"status":"online","monitorando":mon,"total_trades":total,
-        "sinais_scanner":sinais,"ativos_scanner":estado["total_ativos"],
-        "ultimo_scan":estado.get("ultimo_scan"),
-        "horario":datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")})
+        if direcao == "LONG" and abs(preco - entrada) <= tol:
+            enviar_telegram(
+                f"🟢 <b>ENTRADA LONG — {ativo}</b>\n"
+                f"💲 Preço: ${preco:.6g}\n"
+                f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
+            )
+        elif direcao == "SHORT" and abs(preco - entrada) <= tol:
+            enviar_telegram(
+                f"🔴 <b>ENTRADA SHORT — {ativo}</b>\n"
+                f"💲 Preço: ${preco:.6g}\n"
+                f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
+            )
 
-@app.route("/sinais")
-def ver_sinais():
-    rows=cur.execute("SELECT * FROM scanner_log ORDER BY id DESC LIMIT 100").fetchall()
-    cols=[d[0] for d in cur.description]
-    return jsonify([dict(zip(cols,r)) for r in rows])
+# ─────────────────────────────────────────────
+# COMANDOS DO TELEGRAM
+# ─────────────────────────────────────────────
+def processar_comando(texto):
+    partes = texto.strip().split()
+    cmd = partes[0].lower()
 
-@app.route("/ativos")
-def ver_ativos():
-    rows=cur.execute("SELECT * FROM ativos_lbank ORDER BY vol24h DESC LIMIT 100").fetchall()
-    cols=[d[0] for d in cur.description]
-    return jsonify([dict(zip(cols,r)) for r in rows])
+    if cmd in ["/start", "/ajuda"]:
+        return (
+            "🤖 <b>LucSharkTrade v10 — Comandos</b>\n\n"
+            "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
+            "/resultado ATIVO WIN_A1 | LOSS\n"
+            "/trades — trades abertos\n"
+            "/relatorio — estatísticas\n"
+            "/scan — rodar scanner agora\n"
+            "/ativos — total de ativos monitorados\n"
+            "/status — status do bot\n"
+            "/ajuda — este menu"
+        )
 
-# ── Iniciar ───────────────────────────────────────────────────
-def cmd_loop():
+    elif cmd == "/trade":
+        if len(partes) < 10:
+            return "❌ Formato: /trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT"
+        try:
+            ativo, direcao = partes[1].upper(), partes[2].upper()
+            entrada, stop  = float(partes[3]), float(partes[4])
+            a1, a2, a3     = float(partes[5]), float(partes[6]), float(partes[7])
+            tf_ctx, tf_ent = partes[8], partes[9]
+            tid = salvar_trade(ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent)
+            return (
+                f"✅ <b>Trade #{tid} cadastrado!</b>\n"
+                f"📊 {ativo} {direcao}\n"
+                f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}\n"
+                f"⏱ {tf_ctx} / {tf_ent} | 🔄 Monitorando 24/7..."
+            )
+        except Exception as e:
+            return f"❌ Erro: {e}"
+
+    elif cmd == "/resultado":
+        if len(partes) < 3:
+            return "❌ Formato: /resultado ATIVO WIN_A1 | LOSS"
+        ativo = partes[1].upper()
+        res   = " ".join(partes[2:]).upper()
+        atualizar_resultado(ativo, res)
+        return f"✅ {ativo} → {res}"
+
+    elif cmd == "/trades":
+        rows = listar_trades()
+        if not rows:
+            return "📭 Nenhum trade registrado."
+        linhas = ["📊 <b>Últimos Trades</b>\n"]
+        for r in rows:
+            tid, ativo, direcao, entrada, stop, a1, a2, a3, _, _, resultado, criado = r
+            emoji = "🟢" if direcao == "LONG" else "🔴"
+            linhas.append(f"{emoji} #{tid} {ativo} {direcao} ${entrada} → {resultado} ({criado})")
+        return "\n".join(linhas)
+
+    elif cmd == "/relatorio":
+        total, wins, loss, abertos, wr = relatorio()
+        return (
+            f"📈 <b>Relatório LucSharkTrade</b>\n\n"
+            f"Total: {total} | ✅ {wins} | ❌ {loss} | 🔄 {abertos}\n"
+            f"🎯 Win Rate: {wr:.1f}%"
+        )
+
+    elif cmd == "/scan":
+        return "SCAN_SOLICITADO"
+
+    elif cmd == "/ativos":
+        tickers  = buscar_ticker_24h()
+        pares    = buscar_todos_pares()
+        validos  = sum(1 for p in pares
+                       if tickers.get(p) and float(tickers[p].get("turnover", 0)) >= MIN_VOLUME_24H)
+        return (
+            f"📡 <b>Ativos Monitorados</b>\n\n"
+            f"Total LBank: {len(pares)}\n"
+            f"Com volume ≥ ${MIN_VOLUME_24H:,.0f}: {validos}\n"
+            f"Timeframe: 15M\n"
+            f"FORTE ≥{MULT_FORTE}x | MÉDIO ≥{MULT_MEDIO}x | ALERTA ≥{MULT_ALERTA}x"
+        )
+
+    elif cmd == "/status":
+        brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
+        return f"✅ <b>Bot ONLINE</b>\n🕐 {brt}\n💰 Capital: ${CAPITAL_INICIAL:,.2f}"
+
+    return None
+
+# ─────────────────────────────────────────────
+# LOOP PRINCIPAL
+# ─────────────────────────────────────────────
+def main():
+    init_db()
+    brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
+    enviar_telegram(
+        f"🚀 <b>LucSharkTrade v10 ONLINE!</b>\n"
+        f"📅 {brt}\n\n"
+        f"✅ Scanner 15M ativo\n"
+        f"✅ 3 níveis: FORTE ({MULT_FORTE}x) | MÉDIO ({MULT_MEDIO}x) | ALERTA ({MULT_ALERTA}x)\n"
+        f"✅ Monitoramento de trades 24/7\n\n"
+        f"Envie /ajuda para ver os comandos."
+    )
+
+    ultimo_scan   = 0
+    ultimo_offset = None
+
     while True:
-        processar_cmd()
-        time.sleep(15)
+        updates = get_updates(ultimo_offset)
+        for upd in updates:
+            ultimo_offset = upd["update_id"] + 1
+            texto = upd.get("message", {}).get("text", "")
+            if texto.startswith("/"):
+                resposta = processar_comando(texto)
+                if resposta == "SCAN_SOLICITADO":
+                    enviar_telegram("🔍 Scanner iniciado manualmente...")
+                    rodar_scanner()
+                elif resposta:
+                    enviar_telegram(resposta)
 
-if __name__=="__main__":
-    agora=datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")
-    mon=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado="MONITORANDO"').fetchone()[0]
-    tg(f"LucSharkTrade v10 ONLINE!\nMonitor: {mon} trades\nScanner: TODOS os ativos LBank\nFiltro volume: >${MIN_VOLUME_24H:,.0f}\nScan a cada {INTERVALO_SCAN//60} min\n{agora}\n/ajuda para comandos")
-    log.info("Bot v10 iniciado!")
-    threading.Thread(target=monitorar,    daemon=True).start()
-    threading.Thread(target=rodar_scanner,daemon=True).start()
-    threading.Thread(target=cmd_loop,     daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+        monitorar_trades()
+
+        if time.time() - ultimo_scan >= INTERVALO_SCAN:
+            rodar_scanner()
+            ultimo_scan = time.time()
+
+        time.sleep(INTERVALO_SEG)
+
+if __name__ == "__main__":
+    main()
