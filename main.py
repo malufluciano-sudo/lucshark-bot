@@ -14,26 +14,18 @@ CAPITAL_INICIAL  = float(os.environ.get("CAPITAL_INICIAL", "1000"))
 TOLERANCIA_PCT   = float(os.environ.get("TOLERANCIA_PCT", "0.005"))
 INTERVALO_MON    = int(os.environ.get("INTERVALO_MON", "120"))
 INTERVALO_SCAN   = int(os.environ.get("INTERVALO_SCAN", "3600"))
+MIN_VOLUME_24H   = float(os.environ.get("MIN_VOLUME_24H", "100000"))
 PORT             = int(os.environ.get("PORT", "8080"))
 
 BRT = timezone(timedelta(hours=-3))
 DB  = "/app/data/lucshark.db"
 os.makedirs("/app/data", exist_ok=True)
 
-ATIVOS = [
-    "btc_usdt","eth_usdt","bnb_usdt","xrp_usdt","sol_usdt",
-    "link_usdt","ltc_usdt","hyper_usdt","astr_usdt"
-]
-
-PRECO_MAP = {
-    "BTCUSDT":   ("cg","bitcoin"),    "ETHUSDT":  ("cg","ethereum"),
-    "BNBUSDT":   ("cg","binancecoin"),"XRPUSDT":  ("cg","ripple"),
-    "SOLUSDT":   ("cg","solana"),     "LINKUSDT": ("cg","chainlink"),
-    "LTCUSDT":   ("cg","litecoin"),   "HYPEUSDT": ("cg","hyperliquid"),
-    "ASTRUSDT":  ("cg","astar-network"),
-    "XAGUSD":    ("lb","xag_usdt"),   "XAUUSD":   ("lb","xau_usdt"),
-    "XPTUSD":    ("lb","xpt_usdt"),   "XPDUSD":   ("lb","xpd_usdt"),
-    "XTIUSD":    ("lb","xti_usdt"),
+PRECO_MAP_CG = {
+    "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "BNBUSDT": "binancecoin",
+    "XRPUSDT": "ripple",  "SOLUSDT": "solana",   "LINKUSDT": "chainlink",
+    "LTCUSDT": "litecoin","HYPEUSDT":"hyperliquid","ASTRUSDT":"astar-network",
+    "XAGUSD":  "silver",  "XAUUSD":  "gold",
 }
 
 # ── Banco ─────────────────────────────────────────────────────
@@ -50,7 +42,11 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE TABLE IF NOT EXISTS scanner_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    data_hora TEXT, ativo TEXT, sinal TEXT, detalhes TEXT, enviado INTEGER DEFAULT 0
+    data_hora TEXT, ativo TEXT, sinal TEXT, detalhes TEXT
+);
+CREATE TABLE IF NOT EXISTS ativos_lbank (
+    symbol TEXT PRIMARY KEY, vol24h REAL, ativo INTEGER DEFAULT 1,
+    ultima_atualizacao TEXT
 );
 """)
 conn.commit()
@@ -59,8 +55,9 @@ estado = {
     "ultimo_update_id": 0,
     "trade_counter": cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0],
     "monitorando": True,
-    "ativos_monitor": list(ATIVOS),
-    "ultimo_scan": None
+    "ultimo_scan": None,
+    "total_ativos": 0,
+    "ativos_scan": []
 }
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -73,257 +70,283 @@ def tg(msg):
     except Exception as e:
         log.error(f"TG: {e}")
 
-def get_preco(symbol):
-    sym = symbol.upper().replace(".P","")
-    fonte = PRECO_MAP.get(sym)
-    if not fonte: return None
-    tipo, src = fonte
-    if tipo == "cg":
-        try:
-            r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-                params={"ids":src,"vs_currencies":"usd"}, timeout=8)
-            if r.status_code == 200:
-                return r.json().get(src,{}).get("usd")
-        except: pass
-    if tipo == "lb":
-        try:
-            r = requests.get("https://api.lbkex.com/v1/ticker.do",
-                params={"symbol":src}, timeout=8)
-            if r.status_code == 200:
-                v = float(r.json().get("ticker",{}).get("latest",0))
-                return v if v > 0 else None
-        except: pass
+def get_preco_cg(symbol):
+    cg_id = PRECO_MAP_CG.get(symbol.upper())
+    if not cg_id: return None
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": cg_id, "vs_currencies": "usd"}, timeout=8)
+        if r.status_code == 200:
+            return r.json().get(cg_id, {}).get("usd")
+    except: pass
     return None
 
+def get_preco_lbank(symbol):
+    try:
+        r = requests.get("https://api.lbkex.com/v1/ticker.do",
+            params={"symbol": symbol}, timeout=8)
+        if r.status_code == 200:
+            v = float(r.json().get("ticker", {}).get("latest", 0))
+            return v if v > 0 else None
+    except: pass
+    return None
+
+def get_preco(symbol):
+    sym = symbol.upper().replace(".P","")
+    p = get_preco_cg(sym)
+    if p: return p
+    lb_sym = sym.lower().replace("usdt","_usdt").replace("usd","_usd") if "_" not in sym else sym.lower()
+    return get_preco_lbank(lb_sym)
+
+# ── Buscar TODOS os ativos da LBank ──────────────────────────
+def buscar_ativos_lbank():
+    log.info("Buscando todos os ativos da LBank...")
+    try:
+        # Buscar todos os pares
+        r = requests.get("https://api.lbkex.com/v1/currencyPairs.do", timeout=15)
+        if r.status_code != 200:
+            log.error(f"Erro ao buscar pares: {r.status_code}")
+            return []
+        todos_pares = r.json()
+        log.info(f"Total de pares encontrados: {len(todos_pares)}")
+
+        # Buscar ticker de todos para filtrar por volume
+        r2 = requests.get("https://api.lbkex.com/v1/ticker.do",
+            params={"symbol": "all"}, timeout=15)
+
+        pares_com_volume = []
+        if r2.status_code == 200:
+            tickers = r2.json()
+            for item in tickers:
+                symbol = item.get("symbol","")
+                try:
+                    vol = float(item.get("ticker",{}).get("vol",0))
+                    preco = float(item.get("ticker",{}).get("latest",0))
+                    if vol >= MIN_VOLUME_24H and preco > 0:
+                        pares_com_volume.append({"symbol": symbol, "vol24h": vol})
+                        cur.execute("""
+                            INSERT OR REPLACE INTO ativos_lbank (symbol, vol24h, ultima_atualizacao)
+                            VALUES (?,?,?)
+                        """, (symbol, vol, datetime.now(BRT).strftime("%d/%m/%Y %H:%M")))
+                except: continue
+            conn.commit()
+        else:
+            pares_com_volume = [{"symbol": p, "vol24h": 0} for p in todos_pares]
+
+        log.info(f"Ativos com volume > ${MIN_VOLUME_24H:,.0f}: {len(pares_com_volume)}")
+        return pares_com_volume
+
+    except Exception as e:
+        log.error(f"Erro buscar ativos: {e}")
+        return []
+
+# ── Candles e Indicadores ─────────────────────────────────────
 def get_klines(symbol, period, size=100):
     try:
         r = requests.get("https://api.lbkex.com/v1/kline.do",
             params={"symbol":symbol,"size":size,"type":period}, timeout=10)
         if r.status_code != 200: return None
         data = r.json()
-        if not isinstance(data,list) or len(data)==0: return None
+        if not isinstance(data,list) or len(data)<20: return None
         df = pd.DataFrame(data, columns=["timestamp","open","close","high","low","volume"])
         for c in ["open","close","high","low","volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
+        return df.dropna()
     except: return None
 
 def calcular(df):
-    if df is None or len(df) < 20: return df
+    if df is None or len(df)<20: return None
     df = df.copy()
     df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     d = df["close"].diff()
-    g = d.clip(lower=0).ewm(com=13,adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(com=13,adjust=False).mean()
-    df["rsi"]  = 100-(100/(1+g/l))
-    df["vwap"] = (df["close"]*df["volume"]).cumsum()/df["volume"].cumsum()
+    g = d.clip(lower=0).ewm(com=13, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(com=13, adjust=False).mean()
+    df["rsi"]     = 100-(100/(1+g/l))
+    df["vwap"]    = (df["close"]*df["volume"]).cumsum()/df["volume"].cumsum()
     df["vol_med"] = df["volume"].rolling(20).mean()
-    df["vol_ratio"] = df["volume"]/df["vol_med"]
-    # Bollinger Bands
-    df["bb_mid"] = df["close"].rolling(20).mean()
+    df["vol_ratio"]= df["volume"]/df["vol_med"].replace(0, np.nan)
+    df["bb_mid"]  = df["close"].rolling(20).mean()
     std = df["close"].rolling(20).std()
-    df["bb_up"]  = df["bb_mid"] + 2*std
-    df["bb_dn"]  = df["bb_mid"] - 2*std
-    # ATR
-    h,l2,c = df["high"],df["low"],df["close"].shift(1)
-    tr = pd.concat([h-l2,(h-c).abs(),(l2-c).abs()],axis=1).max(axis=1)
+    df["bb_up"]   = df["bb_mid"]+2*std
+    df["bb_dn"]   = df["bb_mid"]-2*std
+    h,lo,c = df["high"],df["low"],df["close"].shift(1)
+    tr = pd.concat([h-lo,(h-c).abs(),(lo-c).abs()],axis=1).max(axis=1)
     df["atr"] = tr.ewm(com=13,adjust=False).mean()
     return df
 
-# ── Scanner ───────────────────────────────────────────────────
+# ── Scanner de sinais ─────────────────────────────────────────
 def analisar_ativo(symbol):
     sinais = []
     try:
         df1h = calcular(get_klines(symbol, "1hour", 100))
-        df5m = calcular(get_klines(symbol, "5min",  100))
-        if df1h is None or df5m is None: return []
+        if df1h is None or len(df1h)<20: return []
 
         u1  = df1h.iloc[-1]
-        u5  = df5m.iloc[-1]
         p2  = df1h.iloc[-2]
-        p5  = df5m.iloc[-2]
-
         preco   = float(u1["close"])
         rsi1h   = float(u1["rsi"])
-        vol1h   = float(u1["vol_ratio"])
+        vol_r   = float(u1["vol_ratio"]) if not pd.isna(u1["vol_ratio"]) else 1.0
         ema9    = float(u1["ema9"])
         ema21   = float(u1["ema21"])
         vwap    = float(u1["vwap"])
-        atr     = float(u1["atr"])
+        bb_up   = float(u1["bb_up"])
+        bb_dn   = float(u1["bb_dn"])
+        ema9_p  = float(p2["ema9"])
+        ema21_p = float(p2["ema21"])
+        rsi_p   = float(p2["rsi"])
 
-        max20_1h = float(df1h["high"].tail(20).max())
-        min20_1h = float(df1h["low"].tail(20).min())
-        max5_5m  = float(df5m["high"].tail(5).max())
-        min5_5m  = float(df5m["low"].tail(5).min())
+        max20 = float(df1h["high"].tail(20).max())
+        min20 = float(df1h["low"].tail(20).min())
+        sym_up = symbol.replace("_usdt","usdt").replace("_usd","usd").upper()
 
-        sym_upper = symbol.replace("_usdt","usdt").upper()
+        # SINAL 1: Tuk Tuk — rompimento com volume
+        if preco >= max20*0.998 and vol_r >= 1.5:
+            sinais.append({"tipo":"TUK TUK LONG","forca":"FORTE",
+                "desc":f"Rompeu maxima {max20:.6f} | Vol {vol_r:.1f}x",
+                "acao":"Aguardar pullback para LONG"})
 
-        # ── SINAL 1: Rompimento de lateralizacao com volume (Tuk Tuk) ──
-        # Preco rompe maxima das ultimas 20 barras com volume > 1.5x media
-        if preco >= max20_1h * 0.998 and vol1h >= 1.5:
-            sinais.append({
-                "tipo": "TUK TUK LONG",
-                "forca": "FORTE",
-                "descricao": f"Rompimento de maxima {max20_1h:.4f} com volume {vol1h:.1f}x acima da media",
-                "acao": f"Aguardar pullback para entrada LONG | Envie print para analise"
-            })
+        if preco <= min20*1.002 and vol_r >= 1.5:
+            sinais.append({"tipo":"TUK TUK SHORT","forca":"FORTE",
+                "desc":f"Rompeu minima {min20:.6f} | Vol {vol_r:.1f}x",
+                "acao":"Aguardar pullback para SHORT"})
 
-        if preco <= min20_1h * 1.002 and vol1h >= 1.5:
-            sinais.append({
-                "tipo": "TUK TUK SHORT",
-                "forca": "FORTE",
-                "descricao": f"Rompimento de minima {min20_1h:.4f} com volume {vol1h:.1f}x acima da media",
-                "acao": f"Aguardar pullback para entrada SHORT | Envie print para analise"
-            })
+        # SINAL 2: EMA Cross
+        if ema9_p < ema21_p and ema9 > ema21 and vol_r >= 1.2:
+            sinais.append({"tipo":"EMA CROSS LONG","forca":"MEDIA",
+                "desc":f"EMA9 cruzou EMA21 para cima | Vol {vol_r:.1f}x",
+                "acao":"Potencial LONG"})
 
-        # ── SINAL 2: Cruzamento de EMAs com volume ──
-        ema9_ant  = float(p2["ema9"])
-        ema21_ant = float(p2["ema21"])
-        if ema9_ant < ema21_ant and ema9 > ema21 and vol1h >= 1.2:
-            sinais.append({
-                "tipo": "EMA CROSS LONG",
-                "forca": "MEDIA",
-                "descricao": f"EMA9 cruzou EMA21 para cima com volume {vol1h:.1f}x",
-                "acao": "Potencial LONG | Envie print para confirmar estrutura"
-            })
+        if ema9_p > ema21_p and ema9 < ema21 and vol_r >= 1.2:
+            sinais.append({"tipo":"EMA CROSS SHORT","forca":"MEDIA",
+                "desc":f"EMA9 cruzou EMA21 para baixo | Vol {vol_r:.1f}x",
+                "acao":"Potencial SHORT"})
 
-        if ema9_ant > ema21_ant and ema9 < ema21 and vol1h >= 1.2:
-            sinais.append({
-                "tipo": "EMA CROSS SHORT",
-                "forca": "MEDIA",
-                "descricao": f"EMA9 cruzou EMA21 para baixo com volume {vol1h:.1f}x",
-                "acao": "Potencial SHORT | Envie print para confirmar estrutura"
-            })
+        # SINAL 3: RSI extremo
+        if rsi1h <= 28 and rsi1h > rsi_p:
+            sinais.append({"tipo":"RSI SOBREVENDA","forca":"MEDIA",
+                "desc":f"RSI {rsi1h:.1f} revertendo para cima",
+                "acao":"Potencial LONG no 5min"})
 
-        # ── SINAL 3: RSI extremo com reversao ──
-        rsi_ant = float(p2["rsi"])
-        if rsi1h <= 30 and rsi1h > rsi_ant:
-            sinais.append({
-                "tipo": "RSI SOBREVENDA",
-                "forca": "MEDIA",
-                "descricao": f"RSI em {rsi1h:.1f} (sobrevenda) com virada para cima",
-                "acao": "Potencial LONG | Aguardar confirmacao no 5min"
-            })
+        if rsi1h >= 72 and rsi1h < rsi_p:
+            sinais.append({"tipo":"RSI SOBRECOMPRA","forca":"MEDIA",
+                "desc":f"RSI {rsi1h:.1f} revertendo para baixo",
+                "acao":"Potencial SHORT no 5min"})
 
-        if rsi1h >= 70 and rsi1h < rsi_ant:
-            sinais.append({
-                "tipo": "RSI SOBRECOMPRA",
-                "forca": "MEDIA",
-                "descricao": f"RSI em {rsi1h:.1f} (sobrecompra) com virada para baixo",
-                "acao": "Potencial SHORT | Aguardar confirmacao no 5min"
-            })
+        # SINAL 4: Toque VWAP
+        dist_vwap = abs(preco-vwap)/vwap if vwap > 0 else 1
+        if dist_vwap <= 0.003 and vol_r >= 1.2:
+            dir_vwap = "LONG" if preco >= vwap else "SHORT"
+            sinais.append({"tipo":f"TOQUE VWAP {dir_vwap}","forca":"MEDIA",
+                "desc":f"Preco {preco:.6f} tocando VWAP {vwap:.6f} | Vol {vol_r:.1f}x",
+                "acao":f"Potencial {dir_vwap}"})
 
-        # ── SINAL 4: Preco tocando VWAP com volume ──
-        dist_vwap = abs(preco - vwap) / vwap
-        if dist_vwap <= 0.003 and vol1h >= 1.3:
-            direcao_vwap = "LONG (suporte)" if preco > vwap else "SHORT (resistencia)"
-            sinais.append({
-                "tipo": f"TOQUE VWAP {direcao_vwap}",
-                "forca": "MEDIA",
-                "descricao": f"Preco ${preco:.4f} tocando VWAP ${vwap:.4f} com volume {vol1h:.1f}x",
-                "acao": "Potencial entrada | Envie print para analise"
-            })
+        # SINAL 5: Volume climatico (Spring/Exaustao)
+        if vol_r >= 3.0 and rsi1h < 35:
+            sinais.append({"tipo":"VOLUME CLIMATICO BAIXA","forca":"FORTE",
+                "desc":f"Vol {vol_r:.1f}x | RSI {rsi1h:.1f} — possivel Spring Wyckoff",
+                "acao":"URGENTE: Possivel capitulacao/Spring"})
 
-        # ── SINAL 5: Volume climático (possivel Spring Wyckoff) ──
-        if vol1h >= 3.0 and rsi1h < 40:
-            sinais.append({
-                "tipo": "VOLUME CLIMATICO BAIXA",
-                "forca": "FORTE",
-                "descricao": f"Volume {vol1h:.1f}x acima da media com RSI {rsi1h:.1f} - possivel capitulacao/Spring",
-                "acao": "ATENCAO: Possivel Spring Wyckoff | Envie print urgente para analise"
-            })
+        if vol_r >= 3.0 and rsi1h > 65:
+            sinais.append({"tipo":"VOLUME CLIMATICO ALTA","forca":"FORTE",
+                "desc":f"Vol {vol_r:.1f}x | RSI {rsi1h:.1f} — possivel exaustao",
+                "acao":"URGENTE: Possivel exaustao compradora"})
 
-        if vol1h >= 3.0 and rsi1h > 60:
-            sinais.append({
-                "tipo": "VOLUME CLIMATICO ALTA",
-                "forca": "FORTE",
-                "descricao": f"Volume {vol1h:.1f}x acima da media com RSI {rsi1h:.1f} - possivel exaustao",
-                "acao": "ATENCAO: Possivel exaustao compradora | Envie print urgente"
-            })
+        # SINAL 6: Bollinger Squeeze (volatilidade comprimida)
+        bb_width = (bb_up - bb_dn) / float(u1["bb_mid"]) if float(u1["bb_mid"]) > 0 else 1
+        bb_hist  = [(float(df1h["bb_up"].iloc[i])-float(df1h["bb_dn"].iloc[i]))/float(df1h["bb_mid"].iloc[i])
+                    for i in range(-20,-1) if float(df1h["bb_mid"].iloc[i]) > 0]
+        if bb_hist and bb_width <= min(bb_hist)*1.1:
+            sinais.append({"tipo":"BOLLINGER SQUEEZE","forca":"MEDIA",
+                "desc":f"Volatilidade comprimida — movimento iminente",
+                "acao":"Monitorar rompimento com volume"})
 
-        # Adicionar preco atual a todos os sinais
         for s in sinais:
-            s["ativo"]  = sym_upper
-            s["preco"]  = preco
-            s["rsi"]    = round(rsi1h, 1)
-            s["volume"] = round(vol1h, 2)
+            s["ativo"] = sym_up
+            s["preco"] = preco
+            s["rsi"]   = round(rsi1h,1)
+            s["vol_r"] = round(vol_r,2)
 
     except Exception as e:
-        log.error(f"Scanner [{symbol}]: {e}")
-
+        log.debug(f"Scan [{symbol}]: {e}")
     return sinais
 
+# ── Runner do scanner ─────────────────────────────────────────
 def rodar_scanner():
     log.info("Scanner iniciado!")
     while True:
         try:
             agora = datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")
-            log.info(f"[{agora}] Iniciando scan de {len(estado['ativos_monitor'])} ativos...")
-            todos_sinais = []
+            log.info(f"[{agora}] Buscando ativos da LBank...")
 
-            for symbol in estado["ativos_monitor"]:
+            # Buscar todos os ativos com volume relevante
+            ativos = buscar_ativos_lbank()
+            if not ativos:
+                log.warning("Sem ativos — usando lista anterior")
+                ativos = [{"symbol":s} for s in estado["ativos_scan"]] if estado["ativos_scan"] else []
+
+            estado["ativos_scan"]  = [a["symbol"] for a in ativos]
+            estado["total_ativos"] = len(ativos)
+
+            tg(f"SCANNER LucSharkTrade\n{agora}\nAnalisando {len(ativos)} ativos...\nAguarde os sinais.")
+
+            todos_sinais = []
+            for i, ativo in enumerate(ativos):
+                symbol = ativo["symbol"]
                 sinais = analisar_ativo(symbol)
                 for s in sinais:
                     todos_sinais.append(s)
-                    cur.execute(
-                        "INSERT INTO scanner_log (data_hora,ativo,sinal,detalhes) VALUES (?,?,?,?)",
-                        (agora, s["ativo"], s["tipo"], s["descricao"])
-                    )
+                    cur.execute("INSERT INTO scanner_log (data_hora,ativo,sinal,detalhes) VALUES (?,?,?,?)",
+                        (agora, s["ativo"], s["tipo"], s["desc"]))
                 conn.commit()
-                time.sleep(2)
+                # Rate limit — pausa a cada 10 ativos
+                if (i+1) % 10 == 0:
+                    time.sleep(2)
 
-            # Enviar alertas dos sinais fortes primeiro
-            fortes  = [s for s in todos_sinais if s["forca"] == "FORTE"]
-            medios  = [s for s in todos_sinais if s["forca"] == "MEDIA"]
+            # Separar por força
+            fortes = [s for s in todos_sinais if s["forca"]=="FORTE"]
+            medios = [s for s in todos_sinais if s["forca"]=="MEDIA"]
 
-            if not todos_sinais:
-                tg(f"SCANNER LucSharkTrade\n{agora}\nNenhum sinal identificado neste ciclo.\nPrximo scan em {INTERVALO_SCAN//60} min.")
-            else:
-                # Resumo
-                msg_resumo = (
-                    f"SCANNER LucSharkTrade\n"
-                    f"{agora}\n"
-                    f"Sinais encontrados: {len(todos_sinais)}\n"
-                    f"Fortes: {len(fortes)} | Medios: {len(medios)}\n"
+            # Resumo
+            tg(f"SCAN CONCLUIDO\n{agora}\nAtivos analisados: {len(ativos)}\nSinais FORTES: {len(fortes)}\nSinais MEDIOS: {len(medios)}\nProximo scan em {INTERVALO_SCAN//60} min")
+
+            # Alertas fortes individualmente
+            for s in fortes:
+                tg(
+                    f"SINAL FORTE — {s['tipo']}\n"
+                    f"Ativo: {s['ativo']} | ${s['preco']:,.6f}\n"
+                    f"RSI: {s['rsi']} | Volume: {s['vol_r']}x\n"
+                    f"Detalhe: {s['desc']}\n"
+                    f"Acao: {s['acao']}\n"
+                    f"Envie o print para analise!"
                 )
-                tg(msg_resumo)
+                time.sleep(1)
 
-                # Sinais fortes — alerta individual
-                for s in fortes:
-                    tg(
-                        f"SINAL FORTE\n"
-                        f"Ativo: {s['ativo']} | ${s['preco']:,.4f}\n"
-                        f"Tipo: {s['tipo']}\n"
-                        f"RSI: {s['rsi']} | Volume: {s['volume']}x\n"
-                        f"Detalhe: {s['descricao']}\n"
-                        f"Acao: {s['acao']}\n"
-                        f"Envie o print para analise completa!"
-                    )
+            # Medios agrupados (max 10 por mensagem)
+            if medios:
+                chunks = [medios[i:i+10] for i in range(0,len(medios),10)]
+                for chunk in chunks:
+                    linhas = ["SINAIS MEDIOS:"]
+                    for s in chunk:
+                        linhas.append(f"• {s['ativo']}: {s['tipo']} | ${s['preco']:,.6f}")
+                    tg("\n".join(linhas))
                     time.sleep(1)
 
-                # Sinais medios — resumo agrupado
-                if medios:
-                    linhas = ["SINAIS MEDIOS:"]
-                    for s in medios:
-                        linhas.append(f"• {s['ativo']}: {s['tipo']} | ${s['preco']:,.4f}")
-                    tg("\n".join(linhas))
-
             estado["ultimo_scan"] = agora
-            log.info(f"Scan concluido: {len(todos_sinais)} sinais")
+            log.info(f"Scan concluido: {len(todos_sinais)} sinais em {len(ativos)} ativos")
             time.sleep(INTERVALO_SCAN)
 
         except Exception as e:
-            log.error(f"Scanner erro: {e}")
+            log.error(f"Scanner: {e}")
             time.sleep(60)
 
-# ── Monitor de precos ─────────────────────────────────────────
+# ── Monitor de trades ─────────────────────────────────────────
 def rr(entrada, stop, alvo, direcao):
     try:
         risco = abs(float(entrada)-float(stop))
         lucro = abs(float(alvo)-float(entrada))
-        return round(lucro/risco,2) if risco > 0 else 0
+        return round(lucro/risco,2) if risco>0 else 0
     except: return 0
 
 def monitorar():
@@ -331,47 +354,45 @@ def monitorar():
     while estado["monitorando"]:
         try:
             rows = cur.execute(
-                "SELECT trade_id,ativo,direcao,entrada,stop,alvo1,alvo2,alvo3,alerta_enviado "
-                "FROM trades WHERE resultado=\"MONITORANDO\""
+                'SELECT trade_id,ativo,direcao,entrada,stop,alvo1,alvo2,alvo3,alerta_enviado '
+                'FROM trades WHERE resultado="MONITORANDO"'
             ).fetchall()
-            agora = datetime.now(BRT).strftime("%H:%M BRT")
-            log.info(f"[{agora}] Monitor: {len(rows)} trade(s)")
+            log.info(f"Monitor: {len(rows)} trade(s)")
             for tid,ativo,direcao,entrada,stop,a1,a2,a3,ja_alertou in rows:
                 entrada=float(entrada); stop=float(stop)
                 a1=float(a1); a2=float(a2); a3=float(a3)
                 preco = get_preco(ativo)
                 if not preco: continue
                 dist = abs(preco-entrada)/entrada
-                log.info(f"  {ativo} {direcao}: ${preco:,.4f} | dist {dist*100:.2f}%")
                 rr1=rr(entrada,stop,a1,direcao)
                 rr2=rr(entrada,stop,a2,direcao)
                 rr3=rr(entrada,stop,a3,direcao)
-                if dist <= TOLERANCIA_PCT and not ja_alertou:
+                if dist<=TOLERANCIA_PCT and not ja_alertou:
                     cur.execute("UPDATE trades SET alerta_enviado=1 WHERE trade_id=?",(tid,))
                     conn.commit()
-                    tg(f"ALERTA DE ENTRADA\nLucSharkTrade | ID: {tid}\nAtivo: {ativo} | {direcao}\nPreco: ${preco:,.4f} | Entrada: ${entrada:,.4f}\nDist: {dist*100:.2f}%\nStop: ${stop:,.4f}\nA1 (RR {rr1}:1): ${a1:,.4f} -> 25%\nA2 (RR {rr2}:1): ${a2:,.4f} -> 50%\nA3 (RR {rr3}:1): ${a3:,.4f} -> 80%\n/resultado {ativo} WIN A1 ou /resultado {ativo} LOSS")
+                    tg(f"ALERTA DE ENTRADA\nID: {tid} | {ativo} {direcao}\nPreco: ${preco:,.6f} | Entrada: ${entrada:,.6f}\nDist: {dist*100:.2f}%\nStop: ${stop:,.6f}\nA1 (RR {rr1}:1): ${a1:,.6f} -> 25%\nA2 (RR {rr2}:1): ${a2:,.6f} -> 50%\nA3 (RR {rr3}:1): ${a3:,.6f} -> 80%\n/resultado {ativo} WIN A1 ou /resultado {ativo} LOSS")
                     continue
                 if not ja_alertou: continue
-                stop_hit = (direcao=="LONG" and preco<=stop) or (direcao=="SHORT" and preco>=stop)
+                stop_hit=(direcao=="LONG" and preco<=stop) or (direcao=="SHORT" and preco>=stop)
                 if stop_hit:
-                    cur.execute("UPDATE trades SET resultado=\"STOP\",preco_saida=? WHERE trade_id=?",(preco,tid))
+                    cur.execute('UPDATE trades SET resultado="STOP",preco_saida=? WHERE trade_id=?',(preco,tid))
                     conn.commit()
-                    tg(f"STOP ATINGIDO\nID: {tid} | {ativo} {direcao}\nEntrada: ${entrada:,.4f} | Saida: ${preco:,.4f}\n/resultado {ativo} LOSS")
+                    tg(f"STOP ATINGIDO\nID: {tid} | {ativo} {direcao}\nEntrada: ${entrada:,.6f} | Saida: ${preco:,.6f}\n/resultado {ativo} LOSS")
                     continue
                 for val,nome,pct in [(a1,"A1",25),(a2,"A2",50),(a3,"A3",80)]:
                     hit=(direcao=="LONG" and preco>=val) or (direcao=="SHORT" and preco<=val)
                     if hit:
                         if nome=="A3":
-                            cur.execute("UPDATE trades SET resultado=\"WIN_A3\",preco_saida=? WHERE trade_id=?",(preco,tid))
+                            cur.execute('UPDATE trades SET resultado="WIN_A3",preco_saida=? WHERE trade_id=?',(preco,tid))
                             conn.commit()
-                        tg(f"{nome} ATINGIDO!\nID: {tid} | {ativo} {direcao}\nPreco: ${preco:,.4f}\nRealizar {pct}%\n/resultado {ativo} WIN {nome}")
+                        tg(f"{nome} ATINGIDO!\nID: {tid} | {ativo} {direcao}\nPreco: ${preco:,.6f}\nRealizar {pct}%\n/resultado {ativo} WIN {nome}")
                         break
             time.sleep(INTERVALO_MON)
         except Exception as e:
             log.error(f"Monitor: {e}")
             time.sleep(30)
 
-# ── Comandos Telegram ─────────────────────────────────────────
+# ── Comandos ──────────────────────────────────────────────────
 def novo_tid():
     estado["trade_counter"] += 1
     return f"LS{estado['trade_counter']:04d}"
@@ -380,18 +401,17 @@ def processar_cmd():
     try:
         r = requests.get(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-            params={"offset":estado["ultimo_update_id"]+1,"timeout":5},
-            timeout=10)
-        if r.status_code != 200: return
+            params={"offset":estado["ultimo_update_id"]+1,"timeout":5}, timeout=10)
+        if r.status_code!=200: return
         for upd in r.json().get("result",[]):
             estado["ultimo_update_id"] = upd["update_id"]
             txt = upd.get("message",{}).get("text","").strip()
             if not txt: continue
-            p = txt.split(); cmd = p[0].lower()
+            p=txt.split(); cmd=p[0].lower()
             log.info(f"CMD: {txt}")
 
-            if cmd == "/trade":
-                if len(p) < 8:
+            if cmd=="/trade":
+                if len(p)<8:
                     tg("Formato:\n/trade ATIVO DIR ENTRADA STOP A1 A2 A3\nEx: /trade BTCUSDT LONG 84000 82000 86000 88000 90000")
                     continue
                 try:
@@ -401,64 +421,72 @@ def processar_cmd():
                     tf_ctx=p[8].upper() if len(p)>8 else "1H"
                     tf_ent=p[9] if len(p)>9 else "5min"
                     rr1=rr(entrada,stop,a1,direcao)
-                    if rr1 < 1.0:
+                    if rr1<1.0:
                         tg(f"Trade DESCARTADO! A1 RR {rr1}:1 (minimo 1:1).")
                         continue
-                    tid = novo_tid()
-                    agora = datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")
+                    tid=novo_tid()
+                    agora=datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")
                     cur.execute("INSERT OR REPLACE INTO trades (trade_id,data_hora,ativo,direcao,tf_ctx,tf_ent,entrada,stop,alvo1,alvo2,alvo3) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (tid,agora,ativo,direcao,tf_ctx,tf_ent,entrada,stop,a1,a2,a3))
                     conn.commit()
                     preco=get_preco(ativo)
-                    ps=f"${preco:,.4f}" if preco else "Indisponivel"
+                    ps=f"${preco:,.6f}" if preco else "Indisponivel"
                     ds=f"{abs(preco-entrada)/entrada*100:.2f}%" if preco else "N/A"
                     rr2=rr(entrada,stop,a2,direcao); rr3=rr(entrada,stop,a3,direcao)
-                    tg(f"TRADE CADASTRADO\nID: {tid} | {ativo} {direcao} | {tf_ctx}/{tf_ent}\nPreco: {ps} ({ds} da entrada)\nEntrada: ${entrada:,.4f} | Stop: ${stop:,.4f}\nA1 (RR {rr1}:1): ${a1:,.4f}\nA2 (RR {rr2}:1): ${a2:,.4f}\nA3 (RR {rr3}:1): ${a3:,.4f}\nMonitorando a cada {INTERVALO_MON//60} min")
+                    tg(f"TRADE CADASTRADO\nID: {tid} | {ativo} {direcao} | {tf_ctx}/{tf_ent}\nPreco: {ps} ({ds})\nEntrada: ${entrada:,.6f} | Stop: ${stop:,.6f}\nA1 (RR {rr1}:1): ${a1:,.6f}\nA2 (RR {rr2}:1): ${a2:,.6f}\nA3 (RR {rr3}:1): ${a3:,.6f}\nMonitorando a cada {INTERVALO_MON//60} min")
                 except Exception as e:
                     tg(f"Erro: {e}")
 
-            elif cmd == "/scan":
+            elif cmd=="/scan":
                 tg("Iniciando scan manual...")
                 threading.Thread(target=rodar_scanner, daemon=True).start()
 
-            elif cmd == "/trades":
+            elif cmd=="/ativos":
+                total=cur.execute("SELECT COUNT(*) FROM ativos_lbank WHERE ativo=1").fetchone()[0]
+                top=cur.execute("SELECT symbol,vol24h FROM ativos_lbank ORDER BY vol24h DESC LIMIT 10").fetchall()
+                linhas=[f"Ativos monitorados: {total}","","Top 10 por volume:"]
+                for sym,vol in top:
+                    linhas.append(f"• {sym}: ${vol:,.0f}")
+                tg("\n".join(linhas))
+
+            elif cmd=="/trades":
                 rows=cur.execute("SELECT trade_id,ativo,direcao,entrada,resultado FROM trades ORDER BY id DESC LIMIT 15").fetchall()
                 if not rows: tg("Nenhum trade.")
                 else:
                     linhas=["Trades:"]
                     for tid,ativo,direcao,entrada,res in rows:
-                        linhas.append(f"{tid} | {ativo} {direcao} ${float(entrada):,.2f} | {res}")
+                        linhas.append(f"{tid} | {ativo} {direcao} ${float(entrada):,.4f} | {res}")
                     tg("\n".join(linhas))
 
-            elif cmd == "/cancelar" and len(p)>=2:
+            elif cmd=="/cancelar" and len(p)>=2:
                 ativo=p[1].upper()
-                cur.execute("UPDATE trades SET resultado=\"CANCELADO\" WHERE ativo=? AND resultado=\"MONITORANDO\"",(ativo,))
+                cur.execute('UPDATE trades SET resultado="CANCELADO" WHERE ativo=? AND resultado="MONITORANDO"',(ativo,))
                 conn.commit(); tg(f"{ativo}: cancelado.")
 
-            elif cmd == "/resultado" and len(p)>=3:
+            elif cmd=="/resultado" and len(p)>=3:
                 ativo=p[1].upper(); res=p[2].upper()
                 nivel=p[3].upper() if len(p)>=4 else ""
                 res_final=f"WIN_{nivel}" if res=="WIN" and nivel else res
-                cur.execute("UPDATE trades SET resultado=? WHERE ativo=? AND resultado=\"MONITORANDO\"",(res_final,ativo))
+                cur.execute('UPDATE trades SET resultado=? WHERE ativo=? AND resultado="MONITORANDO"',(res_final,ativo))
                 conn.commit(); tg(f"{ativo}: {res_final} registrado!")
 
-            elif cmd == "/relatorio":
+            elif cmd=="/relatorio":
                 total=cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-                wins=cur.execute("SELECT COUNT(*) FROM trades WHERE resultado LIKE \"WIN%\"").fetchone()[0]
-                losses=cur.execute("SELECT COUNT(*) FROM trades WHERE resultado IN (\"STOP\",\"LOSS\")").fetchone()[0]
-                mon=cur.execute("SELECT COUNT(*) FROM trades WHERE resultado=\"MONITORANDO\"").fetchone()[0]
+                wins=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado LIKE "WIN%"').fetchone()[0]
+                losses=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado IN ("STOP","LOSS")').fetchone()[0]
+                mon=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado="MONITORANDO"').fetchone()[0]
                 wr=wins/(wins+losses)*100 if (wins+losses)>0 else 0
                 sinais_hoje=cur.execute("SELECT COUNT(*) FROM scanner_log WHERE data_hora LIKE ?",
-                    (datetime.now(BRT).strftime("%d/%m/%Y")+"%" ,)).fetchone()[0]
-                tg(f"RELATORIO LucSharkTrade\n{datetime.now(BRT).strftime('%d/%m/%Y %H:%M BRT')}\nTotal: {total} | Wins: {wins} | Losses: {losses} | Monitor: {mon}\nWin Rate: {wr:.1f}%\nSinais hoje: {sinais_hoje}\nCapital: ${CAPITAL_INICIAL:,.2f}")
+                    (datetime.now(BRT).strftime("%d/%m/%Y")+"%",)).fetchone()[0]
+                tg(f"RELATORIO LucSharkTrade\n{datetime.now(BRT).strftime('%d/%m/%Y %H:%M BRT')}\nTotal: {total} | Wins: {wins} | Losses: {losses} | Monitor: {mon}\nWin Rate: {wr:.1f}%\nSinais hoje: {sinais_hoje}\nAtivos scanner: {estado['total_ativos']}")
 
-            elif cmd == "/status":
-                mon=cur.execute("SELECT COUNT(*) FROM trades WHERE resultado=\"MONITORANDO\"").fetchone()[0]
+            elif cmd=="/status":
+                mon=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado="MONITORANDO"').fetchone()[0]
                 total=cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-                tg(f"Status LucSharkTrade\nMonitorando: {mon} trades\nTotal: {total} trades\nUltimo scan: {estado.get('ultimo_scan','Nunca')}\nAtivos scanner: {len(estado['ativos_monitor'])}\nProximo scan: {INTERVALO_SCAN//60} min\n{datetime.now(BRT).strftime('%d/%m/%Y %H:%M BRT')}")
+                tg(f"Status LucSharkTrade v10\nMonitorando: {mon} trades\nTotal: {total} trades\nAtivos scanner: {estado['total_ativos']}\nUltimo scan: {estado.get('ultimo_scan','Nunca')}\nProximo: {INTERVALO_SCAN//60} min\n{datetime.now(BRT).strftime('%d/%m/%Y %H:%M BRT')}")
 
-            elif cmd == "/ajuda":
-                tg("Comandos LucSharkTrade:\n/trade ATIVO DIR ENTRADA STOP A1 A2 A3\n/scan — rodar scanner agora\n/trades — ver trades\n/cancelar ATIVO\n/resultado ATIVO WIN A1\n/resultado ATIVO LOSS\n/relatorio\n/status\n/ajuda")
+            elif cmd=="/ajuda":
+                tg("Comandos LucSharkTrade v10:\n/trade ATIVO DIR ENTRADA STOP A1 A2 A3\n/scan — scanner manual agora\n/ativos — ver ativos monitorados\n/trades — ver trades\n/cancelar ATIVO\n/resultado ATIVO WIN A1\n/resultado ATIVO LOSS\n/relatorio\n/status\n/ajuda")
 
     except Exception as e:
         log.error(f"Cmd: {e}")
@@ -468,16 +496,23 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    mon=cur.execute("SELECT COUNT(*) FROM trades WHERE resultado=\"MONITORANDO\"").fetchone()[0]
+    mon=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado="MONITORANDO"').fetchone()[0]
     total=cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
     sinais=cur.execute("SELECT COUNT(*) FROM scanner_log").fetchone()[0]
     return jsonify({"status":"online","monitorando":mon,"total_trades":total,
-        "sinais_scanner":sinais,"ultimo_scan":estado.get("ultimo_scan"),
+        "sinais_scanner":sinais,"ativos_scanner":estado["total_ativos"],
+        "ultimo_scan":estado.get("ultimo_scan"),
         "horario":datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")})
 
 @app.route("/sinais")
 def ver_sinais():
-    rows=cur.execute("SELECT * FROM scanner_log ORDER BY id DESC LIMIT 50").fetchall()
+    rows=cur.execute("SELECT * FROM scanner_log ORDER BY id DESC LIMIT 100").fetchall()
+    cols=[d[0] for d in cur.description]
+    return jsonify([dict(zip(cols,r)) for r in rows])
+
+@app.route("/ativos")
+def ver_ativos():
+    rows=cur.execute("SELECT * FROM ativos_lbank ORDER BY vol24h DESC LIMIT 100").fetchall()
     cols=[d[0] for d in cur.description]
     return jsonify([dict(zip(cols,r)) for r in rows])
 
@@ -487,12 +522,12 @@ def cmd_loop():
         processar_cmd()
         time.sleep(15)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     agora=datetime.now(BRT).strftime("%d/%m/%Y %H:%M BRT")
-    mon=cur.execute("SELECT COUNT(*) FROM trades WHERE resultado=\"MONITORANDO\"").fetchone()[0]
-    tg(f"LucSharkTrade v9 ONLINE!\nMonitor: {mon} trades\nScanner: {len(ATIVOS)} ativos\nScan a cada {INTERVALO_SCAN//60} min\n{agora}\n/ajuda para comandos")
-    log.info("Bot v9 iniciado!")
-    threading.Thread(target=monitorar,  daemon=True).start()
-    threading.Thread(target=rodar_scanner, daemon=True).start()
-    threading.Thread(target=cmd_loop,   daemon=True).start()
+    mon=cur.execute('SELECT COUNT(*) FROM trades WHERE resultado="MONITORANDO"').fetchone()[0]
+    tg(f"LucSharkTrade v10 ONLINE!\nMonitor: {mon} trades\nScanner: TODOS os ativos LBank\nFiltro volume: >${MIN_VOLUME_24H:,.0f}\nScan a cada {INTERVALO_SCAN//60} min\n{agora}\n/ajuda para comandos")
+    log.info("Bot v10 iniciado!")
+    threading.Thread(target=monitorar,    daemon=True).start()
+    threading.Thread(target=rodar_scanner,daemon=True).start()
+    threading.Thread(target=cmd_loop,     daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
