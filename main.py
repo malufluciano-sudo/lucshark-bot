@@ -3,7 +3,13 @@ import time
 import requests
 import logging
 import sqlite3
+import threading
+import json
 from datetime import datetime, timezone, timedelta
+from flask import Flask, jsonify
+
+# Flask app para expor dados ao dashboard
+flask_app = Flask(__name__)
 
 # ─────────────────────────────────────────────
 # CONFIGURAÇÃO
@@ -1364,6 +1370,66 @@ def relatorio_diario():
     log.info("Relatório diário enviado.")
 
 
+# ── API HTTP — dados para o dashboard ──
+@flask_app.route("/api/trades")
+def api_trades():
+    try:
+        conn = sqlite3.connect("trades.db")
+        c = conn.cursor()
+        c.execute("SELECT * FROM trades ORDER BY id DESC")
+        rows = c.fetchall()
+        conn.close()
+        trades = []
+        for r in rows:
+            trades.append({
+                "id": r[0], "ativo": r[1], "direcao": r[2],
+                "entrada": r[3], "stop": r[4],
+                "a1": r[5], "a2": r[6], "a3": r[7],
+                "tf_ctx": r[8], "tf_ent": r[9],
+                "resultado": r[10], "criado_em": r[11]
+            })
+        return jsonify({"trades": trades, "total": len(trades)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@flask_app.route("/api/stats")
+def api_stats():
+    try:
+        conn = sqlite3.connect("trades.db")
+        c = conn.cursor()
+        c.execute("SELECT resultado FROM trades")
+        todos = c.fetchall()
+        conn.close()
+        wins    = sum(1 for r in todos if r[0] and r[0].startswith("WIN"))
+        losses  = sum(1 for r in todos if r[0] == "LOSS")
+        abertos = sum(1 for r in todos if not r[0] or r[0] == "ABERTO")
+        wr = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+        RISCO = 20
+        pnl = 0
+        for r in todos:
+            res = r[0] or ""
+            if "A3" in res:    pnl += RISCO * 3
+            elif "A2" in res:  pnl += RISCO * 2
+            elif "WIN" in res: pnl += RISCO
+            elif res == "LOSS": pnl -= RISCO
+        return jsonify({
+            "total": len(todos), "wins": wins,
+            "losses": losses, "abertos": abertos,
+            "win_rate": round(wr, 1), "pnl": round(pnl, 2),
+            "capital": round(1000 + pnl, 2)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@flask_app.route("/health")
+def health():
+    return jsonify({"status": "online", "version": "v12"})
+
+def iniciar_flask():
+    """Roda o Flask em thread separada para não bloquear o bot."""
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
 def processar_comando(texto):
     partes = texto.strip().split()
     cmd    = partes[0].lower()
@@ -1510,6 +1576,10 @@ def processar_comando(texto):
 def main():
     init_db()
     init_exchanges()
+    # Iniciar Flask API em thread separada
+    flask_thread = threading.Thread(target=iniciar_flask, daemon=True)
+    flask_thread.start()
+    log.info("Flask API iniciado")
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     enviar_telegram(
         f"🚀 <b>LucSharkTrade v12 ONLINE!</b>\n"
