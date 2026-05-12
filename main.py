@@ -12,7 +12,7 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CAPITAL_INICIAL  = float(os.environ.get("CAPITAL_INICIAL", "1000"))
 TOLERANCIA_PCT   = float(os.environ.get("TOLERANCIA_PCT", "0.005"))
-INTERVALO_SEG    = int(os.environ.get("INTERVALO_SEG", "120"))
+INTERVALO_SEG    = int(os.environ.get("INTERVALO_SEG", "30"))
 INTERVALO_SCAN   = int(os.environ.get("INTERVALO_SCAN", "3600"))
 MIN_VOLUME_24H   = float(os.environ.get("MIN_VOLUME_24H", "100000"))
 
@@ -613,6 +613,59 @@ def rodar_scanner():
     log.info(f"Scan concluído. Max:{len(prioridade_max)} Alta:{len(alta_prioridade)}")
 
 
+def normalizar_symbol_ccxt(ativo):
+    """Converte BTCUSDT, BTC-USDT, BTC_USDT → BTC/USDT para ccxt."""
+    s = ativo.upper().strip()
+    # Já tem barra
+    if "/" in s:
+        return s
+    # Tem hífen: BTC-USDT → BTC/USDT
+    if "-" in s:
+        return s.replace("-", "/")
+    # Tem underscore: BTC_USDT → BTC/USDT
+    if "_" in s:
+        return s.replace("_", "/")
+    # Sem separador: BTCUSDT → tentar split em USDT/USDC/BTC/ETH
+    for quote in ["USDT", "USDC", "BTC", "ETH", "BNB"]:
+        if s.endswith(quote) and len(s) > len(quote):
+            base = s[:-len(quote)]
+            return f"{base}/{quote}"
+    return s
+
+def buscar_preco_atual(ativo):
+    """Busca preço atual via ccxt ticker — mais rápido e confiável que candles."""
+    symbol = normalizar_symbol_ccxt(ativo)
+    if CCXT_AVAILABLE:
+        try:
+            ticker = _exchange.fetch_ticker(symbol)
+            return {
+                "preco": ticker["last"],
+                "high":  ticker["high"],
+                "low":   ticker["low"],
+                "bid":   ticker.get("bid", ticker["last"]),
+                "ask":   ticker.get("ask", ticker["last"]),
+            }
+        except Exception as e:
+            log.debug(f"Ticker {symbol}: {e}")
+    # Fallback: candles
+    sym_lbank = symbol.lower().replace("/", "_")
+    candles = buscar_candles(sym_lbank, "minute5", 3)
+    if candles:
+        parsed = [parse_candle(c) for c in candles]
+        parsed = [p for p in parsed if p is not None]
+        if parsed:
+            return {
+                "preco": parsed[-1]["c"],
+                "high":  parsed[-1]["h"],
+                "low":   parsed[-1]["l"],
+                "bid":   parsed[-1]["c"],
+                "ask":   parsed[-1]["c"],
+            }
+    return None
+
+# Controle de alertas já enviados (evita duplicatas no mesmo ciclo)
+_alertas_enviados = {}
+
 def monitorar_trades():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -622,32 +675,53 @@ def monitorar_trades():
 
     for trade in abertos:
         tid, ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, resultado, criado = trade
-        symbol = ativo.lower().replace("/", "_").replace("-", "_")
-        candles = buscar_candles(symbol, "minute5", 5)
-        if not candles:
+
+        dados = buscar_preco_atual(ativo)
+        if not dados:
+            log.warning(f"Sem preço para {ativo}")
             continue
 
-        parsed = [parse_candle(c) for c in candles]
-        parsed = [p for p in parsed if p is not None]
-        if not parsed:
-            continue
+        preco = dados["preco"]
+        high  = dados["high"]
+        low   = dados["low"]
 
-        preco = parsed[-1]["c"]
-        high  = parsed[-1]["h"]
-        low   = parsed[-1]["l"]
-        tol   = entrada * TOLERANCIA_PCT
+        # Tolerância de 1% para não perder movimentos rápidos
+        tol = entrada * 0.01
+
+        chave_base = f"{tid}_{ativo}"
 
         if direcao == "LONG":
             # Entrada acionada
-            if abs(preco - entrada) <= tol:
+            chave_entrada = f"{chave_base}_entrada"
+            if abs(preco - entrada) <= tol and chave_entrada not in _alertas_enviados:
+                _alertas_enviados[chave_entrada] = True
                 enviar_telegram(
                     f"🟢 <b>ENTRADA LONG — {ativo}</b>\n"
                     f"💲 Preço: ${preco:.6g}\n"
                     f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
                     f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
                 )
+            # A3 atingido (verificar do maior para o menor)
+            elif high >= a3 and f"{chave_base}_a3" not in _alertas_enviados:
+                _alertas_enviados[f"{chave_base}_a3"] = True
+                enviar_telegram(
+                    f"🏆 <b>A3 ATINGIDO — {ativo} LONG #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
+                    f"✅ Realizar 80% da posição\n"
+                    f"🎉 Trailing Stop ativo no restante!"
+                )
+            # A2 atingido
+            elif high >= a2 and f"{chave_base}_a2" not in _alertas_enviados:
+                _alertas_enviados[f"{chave_base}_a2"] = True
+                enviar_telegram(
+                    f"🎯 <b>A2 ATINGIDO — {ativo} LONG #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
+                    f"✅ Realizar 50% da posição\n"
+                    f"⏳ Aguardar A3: ${a3}"
+                )
             # A1 atingido
-            elif high >= a1:
+            elif high >= a1 and f"{chave_base}_a1" not in _alertas_enviados:
+                _alertas_enviados[f"{chave_base}_a1"] = True
                 enviar_telegram(
                     f"🎯 <b>A1 ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
@@ -655,24 +729,9 @@ def monitorar_trades():
                     f"🔒 Mover Stop para entrada ${entrada} (breakeven)\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
-            # A2 atingido
-            elif high >= a2:
-                enviar_telegram(
-                    f"🎯 <b>A2 ATINGIDO — {ativo} LONG #{tid}</b>\n"
-                    f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
-                    f"✅ Realizar 50% da posição\n"
-                    f"⏳ Aguardar A3: ${a3}"
-                )
-            # A3 atingido
-            elif high >= a3:
-                enviar_telegram(
-                    f"🏆 <b>A3 ATINGIDO — {ativo} LONG #{tid}</b>\n"
-                    f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
-                    f"✅ Realizar 80% da posição\n"
-                    f"🎉 Trailing Stop ativo no restante!"
-                )
             # Stop atingido
-            elif low <= stop:
+            elif low <= stop and f"{chave_base}_stop" not in _alertas_enviados:
+                _alertas_enviados[f"{chave_base}_stop"] = True
                 enviar_telegram(
                     f"🛑 <b>STOP ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
@@ -681,15 +740,36 @@ def monitorar_trades():
 
         elif direcao == "SHORT":
             # Entrada acionada
-            if abs(preco - entrada) <= tol:
+            chave_entrada = f"{chave_base}_entrada"
+            if abs(preco - entrada) <= tol and chave_entrada not in _alertas_enviados:
+                _alertas_enviados[chave_entrada] = True
                 enviar_telegram(
                     f"🔴 <b>ENTRADA SHORT — {ativo}</b>\n"
                     f"💲 Preço: ${preco:.6g}\n"
                     f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
                     f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
                 )
+            # A3 atingido (verificar do maior para o menor)
+            elif low <= a3 and f"{chave_base}_a3" not in _alertas_enviados:
+                _alertas_enviados[f"{chave_base}_a3"] = True
+                enviar_telegram(
+                    f"🏆 <b>A3 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
+                    f"✅ Realizar 80% da posição\n"
+                    f"🎉 Trailing Stop ativo no restante!"
+                )
+            # A2 atingido
+            elif low <= a2 and f"{chave_base}_a2" not in _alertas_enviados:
+                _alertas_enviados[f"{chave_base}_a2"] = True
+                enviar_telegram(
+                    f"🎯 <b>A2 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
+                    f"✅ Realizar 50% da posição\n"
+                    f"⏳ Aguardar A3: ${a3}"
+                )
             # A1 atingido
-            elif low <= a1:
+            elif low <= a1 and f"{chave_base}_a1" not in _alertas_enviados:
+                _alertas_enviados[f"{chave_base}_a1"] = True
                 enviar_telegram(
                     f"🎯 <b>A1 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
@@ -697,24 +777,9 @@ def monitorar_trades():
                     f"🔒 Mover Stop para entrada ${entrada} (breakeven)\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
-            # A2 atingido
-            elif low <= a2:
-                enviar_telegram(
-                    f"🎯 <b>A2 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
-                    f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
-                    f"✅ Realizar 50% da posição\n"
-                    f"⏳ Aguardar A3: ${a3}"
-                )
-            # A3 atingido
-            elif low <= a3:
-                enviar_telegram(
-                    f"🏆 <b>A3 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
-                    f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
-                    f"✅ Realizar 80% da posição\n"
-                    f"🎉 Trailing Stop ativo no restante!"
-                )
             # Stop atingido
-            elif high >= stop:
+            elif high >= stop and f"{chave_base}_stop" not in _alertas_enviados:
+                _alertas_enviados[f"{chave_base}_stop"] = True
                 enviar_telegram(
                     f"🛑 <b>STOP ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
