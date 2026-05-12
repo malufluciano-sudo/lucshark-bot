@@ -145,39 +145,93 @@ def get_updates(offset=None):
 # ─────────────────────────────────────────────
 LBANK_BASE = "https://api.lbank.info"
 
+# ── EXCHANGES SUPORTADAS (todas gratuitas via ccxt) ──
+EXCHANGES_CONFIG = [
+    {"id": "lbank",   "label": "LBank",   "instance": None},
+    {"id": "binance", "label": "Binance", "instance": None},
+    {"id": "bybit",   "label": "Bybit",   "instance": None},
+]
+
+def init_exchanges():
+    """Inicializa instâncias ccxt para cada exchange."""
+    import ccxt as _ccxt_local
+    for ex in EXCHANGES_CONFIG:
+        try:
+            instance = getattr(_ccxt_local, ex["id"])({"enableRateLimit": True})
+            instance.load_markets()
+            ex["instance"] = instance
+            log.info(f"Exchange {ex['label']}: OK ({len(instance.markets)} mercados)")
+        except Exception as e:
+            log.warning(f"Exchange {ex['label']}: falhou — {e}")
+
 def buscar_todos_pares():
-    try:
-        r = requests.get(f"{LBANK_BASE}/v2/currencyPairs.do", timeout=15)
-        dados = r.json()
-        if dados.get("result") == "true":
-            return dados.get("data", [])
-    except Exception as e:
-        log.error(f"Erro ao buscar pares: {e}")
-    return []
+    """Busca pares de todas as exchanges configuradas."""
+    todos = []
+    for ex in EXCHANGES_CONFIG:
+        if not ex["instance"]:
+            continue
+        try:
+            mercados = ex["instance"].markets
+            for symbol, info in mercados.items():
+                if info.get("active") and info.get("quote") in ["USDT","USDC"]:
+                    # Normalizar para formato interno: BTC/USDT@binance
+                    todos.append(f"{symbol}@{ex['id']}")
+        except Exception as e:
+            log.error(f"Pares {ex['label']}: {e}")
+    # Fallback LBank via REST se ccxt falhar
+    if not todos:
+        try:
+            r = requests.get(f"{LBANK_BASE}/v2/currencyPairs.do", timeout=15)
+            dados = r.json()
+            if dados.get("result") == "true":
+                todos = [f"{p}@lbank" for p in dados.get("data", [])]
+        except Exception as e:
+            log.error(f"LBank fallback: {e}")
+    return todos
 
 def buscar_ticker_24h():
-    try:
-        r = requests.get(f"{LBANK_BASE}/v2/ticker/24hr.do?symbol=all", timeout=15)
-        dados = r.json()
-        if dados.get("result") == "true":
-            return {d["symbol"]: d for d in dados.get("data", [])}
-    except Exception as e:
-        log.error(f"Erro ticker 24h: {e}")
-    return {}
+    """Busca tickers de todas as exchanges — retorna dict normalizado."""
+    tickers = {}
+    for ex in EXCHANGES_CONFIG:
+        if not ex["instance"]:
+            continue
+        try:
+            raw = ex["instance"].fetch_tickers()
+            for symbol, t in raw.items():
+                chave = f"{symbol}@{ex['id']}"
+                tickers[chave] = {
+                    "turnover":   t.get("quoteVolume", 0) or 0,
+                    "vol":        t.get("baseVolume", 0) or 0,
+                    "last":       t.get("last", 0) or 0,
+                    "exchange":   ex["label"],
+                }
+        except Exception as e:
+            log.error(f"Ticker {ex['label']}: {e}")
+    return tickers
 
 def extrair_volume(ticker_data):
-    """Extrai volume do ticker tentando múltiplos campos."""
+    """Extrai volume USD do ticker normalizado."""
     if not ticker_data:
         return 0
-    for campo in ["turnover", "vol", "volume", "quoteVolume", "quote_volume"]:
-        val = ticker_data.get(campo, 0)
+    for campo in ["turnover", "quoteVolume", "vol", "volume"]:
         try:
-            v = float(val)
+            v = float(ticker_data.get(campo, 0) or 0)
             if v > 0:
                 return v
         except:
             pass
     return 0
+
+def buscar_todos_pares_lbank():
+    """Legado — mantido para compatibilidade."""
+    try:
+        r = requests.get(f"{LBANK_BASE}/v2/currencyPairs.do", timeout=15)
+        dados = r.json()
+        if dados.get("result") == "true":
+            return dados.get("data", [])
+    except:
+        pass
+    return []
 
 # LBank timeframe map (ccxt standard)
 LBANK_TF_MAP = {
@@ -208,28 +262,47 @@ except Exception as e:
 
 def buscar_candles(symbol, tf=None, tamanho=50):
     """
-    Busca candles via ccxt (biblioteca testada e mantida).
-    Retorna: [[timestamp, open, high, low, close, volume], ...]
+    Busca candles via ccxt — suporta BTC/USDT, BTCUSDT, BTC_USDT, BTC/USDT@binance
+    Retorna: [[timestamp_sec, open, high, low, close, volume], ...]
     """
-    raw_tf   = tf or TIMEFRAME_SCAN
-    ccxt_tf  = LBANK_TF_MAP.get(raw_tf, "15m")
-    # Normalizar symbol para formato ccxt: btc_usdt -> BTC/USDT
-    sym_upper = symbol.upper().replace("_", "/")
+    raw_tf  = tf or TIMEFRAME_SCAN
+    ccxt_tf = LBANK_TF_MAP.get(raw_tf, "15m")
 
-    if CCXT_AVAILABLE:
+    # Extrair exchange do sufixo @exchange
+    exchange_id = "lbank"
+    sym_clean   = symbol
+    if "@" in symbol:
+        sym_clean, exchange_id = symbol.rsplit("@", 1)
+
+    # Normalizar para ccxt: BTC/USDT
+    sym_upper = sym_clean.upper().replace("_", "/")
+    if "/" not in sym_upper:
+        for q in ["USDT","USDC","BTC","ETH"]:
+            if sym_upper.endswith(q):
+                sym_upper = sym_upper[:-len(q)] + "/" + q
+                break
+
+    # Selecionar instância da exchange correta
+    ex_instance = None
+    for ex in EXCHANGES_CONFIG:
+        if ex["id"] == exchange_id and ex["instance"]:
+            ex_instance = ex["instance"]
+            break
+    if ex_instance is None and CCXT_AVAILABLE:
+        ex_instance = _exchange  # fallback global LBank
+
+    if ex_instance:
         try:
-            ohlcv = _exchange.fetch_ohlcv(sym_upper, ccxt_tf, limit=tamanho)
-            # ccxt returns [[ts_ms, o, h, l, c, v], ...]
-            # Convert to [ts_sec, o, h, l, c, v]
+            ohlcv = ex_instance.fetch_ohlcv(sym_upper, ccxt_tf, limit=tamanho)
             return [[c[0]//1000, c[1], c[2], c[3], c[4], c[5]] for c in ohlcv if c]
         except Exception as e:
             log.debug(f"ccxt {symbol}: {e}")
 
-    # Fallback: requests direto com parametros corretos
+    # Fallback REST LBank
     try:
         ts_sec = int(time.time())
         r = requests.get("https://api.lbank.info/v2/kline.do", params={
-            "symbol": symbol.lower(),
+            "symbol": sym_clean.lower().replace("/","_"),
             "size":   tamanho,
             "type":   raw_tf if raw_tf in ["minute15","minute5","hour1"] else "minute15",
             "time":   ts_sec
@@ -243,9 +316,7 @@ def buscar_candles(symbol, tf=None, tamanho=50):
         log.error(f"Candles fallback {symbol}: {e}")
     return []
 
-# ─────────────────────────────────────────────
-# INDICADORES
-# ─────────────────────────────────────────────
+
 def calcular_ema(valores, periodo):
     if len(valores) < periodo:
         return []
@@ -407,17 +478,27 @@ def analisar_ativo(symbol, candles):
     if forca_max == "FORTE":  score += 20
     elif forca_max == "MÉDIO": score += 10
 
+    # Extrair exchange do símbolo
+    exchange_label = ""
+    if "@" in symbol:
+        _, ex_id = symbol.rsplit("@", 1)
+        for ex in EXCHANGES_CONFIG:
+            if ex["id"] == ex_id:
+                exchange_label = ex["label"]
+                break
+
     return {
-        "symbol": symbol.upper(),
-        "preco": preco,
-        "vol_rel": vol_rel,
-        "rsi": rsi,
-        "vwap": round(vwap, 4),
-        "suporte": round(suporte, 4),
+        "symbol":    symbol.split("@")[0].upper(),
+        "preco":     preco,
+        "vol_rel":   vol_rel,
+        "rsi":       rsi,
+        "vwap":      round(vwap, 4),
+        "suporte":   round(suporte, 4),
         "resistencia": round(resist, 4),
-        "sinais": sinais,
+        "sinais":    sinais,
         "forca_max": forca_max,
-        "score": min(score, 100)
+        "score":     min(score, 100),
+        "exchange":  exchange_label,
     }
 
 # ─────────────────────────────────────────────
@@ -835,10 +916,12 @@ def rodar_scanner():
             sent = buscar_sentimento(r["symbol"])
             sent_txt = formatar_sentimento(sent)
             score_bar = "█" * (r.get("score",0)//10) + "░" * (10 - r.get("score",0)//10)
+            ex_label = r.get("exchange", "")
             linhas.append(
                 f"{i}. <b>{r['symbol']}</b> {r['vies_emoji']} {r['vies']}"
                 f" | Vol <b>{r['vol_rel']}x</b> | RSI {r['rsi']}"
                 f" | 💲{r['preco']:.6g}"
+                + (f" | {ex_label}" if ex_label else "")
             )
             linhas.append(f"   Score: {r.get('score',0)}/100 [{score_bar}]")
             if sent_txt:
@@ -852,10 +935,12 @@ def rodar_scanner():
             sent = buscar_sentimento(r["symbol"])
             sent_txt = formatar_sentimento(sent)
             score_bar = "█" * (r.get("score",0)//10) + "░" * (10 - r.get("score",0)//10)
+            ex_label = r.get("exchange", "")
             linhas.append(
                 f"{i}. <b>{r['symbol']}</b> {r['vies_emoji']} {r['vies']}"
                 f" | Vol <b>{r['vol_rel']}x</b> | RSI {r['rsi']}"
                 f" | 💲{r['preco']:.6g}"
+                + (f" | {ex_label}" if ex_label else "")
             )
             linhas.append(f"   Score: {r.get('score',0)}/100 [{score_bar}]")
             if sent_txt:
@@ -1154,6 +1239,76 @@ def monitorar_trades():
                 )
 
 
+def relatorio_semanal():
+    """Relatório semanal automático — segunda-feira às 9h BRT."""
+    brt  = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
+    conn = sqlite3.connect("trades.db")
+    c    = conn.cursor()
+
+    # Trades da última semana
+    c.execute("""
+        SELECT ativo, direcao, entrada, resultado, criado_em
+        FROM trades
+        WHERE DATE(criado_em) >= DATE('now', '-7 days')
+        ORDER BY criado_em
+    """)
+    semana = c.fetchall()
+    conn.close()
+
+    if not semana:
+        enviar_telegram(f"📊 <b>Relatório Semanal</b>\n{brt}\nNenhum trade na última semana.")
+        return
+
+    wins   = [t for t in semana if t[3] and t[3].startswith("WIN")]
+    losses = [t for t in semana if t[3] == "LOSS"]
+    wr     = (len(wins)/(len(wins)+len(losses))*100) if (wins or losses) else 0
+
+    # P&L estimado
+    RISCO = 20
+    pnl   = 0
+    for t in wins:
+        if "A3" in (t[3] or ""): pnl += RISCO * 3
+        elif "A2" in (t[3] or ""): pnl += RISCO * 2
+        else: pnl += RISCO
+    pnl -= len(losses) * RISCO
+
+    # Melhor e pior ativo
+    contagem = {}
+    for t in semana:
+        ativo = t[0]
+        if ativo not in contagem:
+            contagem[ativo] = {"w": 0, "l": 0}
+        if t[3] and t[3].startswith("WIN"):
+            contagem[ativo]["w"] += 1
+        elif t[3] == "LOSS":
+            contagem[ativo]["l"] += 1
+
+    melhor = max(contagem, key=lambda a: contagem[a]["w"] - contagem[a]["l"]) if contagem else "—"
+    pior   = min(contagem, key=lambda a: contagem[a]["w"] - contagem[a]["l"]) if contagem else "—"
+
+    sinal = "+" if pnl >= 0 else ""
+    emoji = "📈" if pnl >= 0 else "📉"
+
+    msg = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>RELATÓRIO SEMANAL — LucSharkTrade</b>\n"
+        f"📅 {brt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"<b>SEMANA</b>\n"
+        f"Total trades: {len(semana)}\n"
+        f"✅ Wins: {len(wins)} | ❌ Losses: {len(losses)}\n"
+        f"🎯 Win Rate: {wr:.1f}%\n"
+        f"{emoji} P&L: {sinal}${pnl:.2f}\n"
+        f"\n"
+        f"<b>DESTAQUES</b>\n"
+        f"🏆 Melhor ativo: {melhor} ({contagem.get(melhor,{}).get('w',0)}W/{contagem.get(melhor,{}).get('l',0)}L)\n"
+        f"⚠️ Ativo problemático: {pior}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    enviar_telegram(msg)
+    log.info("Relatório semanal enviado.")
+
 def relatorio_diario():
     """Relatório automático diário às 18h BRT."""
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
@@ -1208,14 +1363,160 @@ def relatorio_diario():
     enviar_telegram(msg)
     log.info("Relatório diário enviado.")
 
+
+def processar_comando(texto):
+    partes = texto.strip().split()
+    cmd    = partes[0].lower()
+
+    if cmd in ["/start", "/ajuda"]:
+        return (
+            "🤖 <b>LucSharkTrade v12 — Comandos</b>\n\n"
+            "<b>📊 TRADES</b>\n"
+            "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
+            "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
+            "/trades — trades abertos\n"
+            "/relatorio — estatísticas e P&L\n"
+            "/semana — relatório da semana\n\n"
+            "<b>🔍 SCANNER</b>\n"
+            "/scan — rodar scanner agora\n"
+            "/ativos — exchanges e ativos monitorados\n\n"
+            "<b>🚫 BLACKLIST</b>\n"
+            "/bloquear ATIVO [motivo]\n"
+            "/desbloquear ATIVO\n"
+            "/blacklist — ver bloqueados\n\n"
+            "<b>⚙️ SISTEMA</b>\n"
+            "/status — status do bot\n"
+            "/debug — diagnóstico da API\n"
+            "/ajuda — este menu"
+        )
+
+    elif cmd == "/trade":
+        if len(partes) < 10:
+            return "❌ Formato: /trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT"
+        try:
+            ativo, direcao = partes[1].upper(), partes[2].upper()
+            entrada, stop  = float(partes[3]), float(partes[4])
+            a1, a2, a3     = float(partes[5]), float(partes[6]), float(partes[7])
+            tf_ctx, tf_ent = partes[8], partes[9]
+            tid = salvar_trade(ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent)
+            return (
+                f"✅ <b>Trade #{tid} cadastrado!</b>\n"
+                f"📊 {ativo} {direcao}\n"
+                f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}\n"
+                f"⏱ {tf_ctx}/{tf_ent} | 🔄 Monitorando 24/7..."
+            )
+        except Exception as e:
+            return f"❌ Erro: {e}"
+
+    elif cmd == "/resultado":
+        if len(partes) < 3:
+            return "❌ Formato: /resultado ATIVO WIN_A1 | LOSS"
+        ativo = partes[1].upper()
+        res   = " ".join(partes[2:]).upper()
+        atualizar_resultado(ativo, res)
+        return f"✅ {ativo} → {res}"
+
+    elif cmd == "/trades":
+        rows = listar_trades()
+        if not rows:
+            return "📭 Nenhum trade registrado."
+        linhas = ["📊 <b>Últimos Trades</b>\n"]
+        for r in rows:
+            tid, ativo, direcao, entrada, stop, a1, a2, a3, _, _, resultado, criado = r
+            emoji = "🟢" if direcao == "LONG" else "🔴"
+            linhas.append(f"{emoji} #{tid} {ativo} {direcao} ${entrada} → {resultado or 'ABERTO'} ({criado})")
+        return "\n".join(linhas)
+
+    elif cmd == "/relatorio":
+        total, wins, loss, abertos, wr = relatorio()
+        RISCO = 20
+        conn  = sqlite3.connect("trades.db")
+        c     = conn.cursor()
+        c.execute("SELECT resultado FROM trades")
+        todos = c.fetchall()
+        conn.close()
+        pnl = 0
+        for r in todos:
+            res = r[0] or ""
+            if "A3" in res:   pnl += RISCO * 3
+            elif "A2" in res: pnl += RISCO * 2
+            elif "WIN" in res: pnl += RISCO
+            elif res == "LOSS": pnl -= RISCO
+        sinal = "+" if pnl >= 0 else ""
+        return (
+            f"📈 <b>Relatório LucSharkTrade</b>\n\n"
+            f"Total: {total} | ✅ {wins} | ❌ {loss} | 🔄 {abertos}\n"
+            f"🎯 Win Rate: {wr:.1f}%\n"
+            f"💰 P&L: {sinal}${pnl:.2f}"
+        )
+
+    elif cmd == "/semana":
+        relatorio_semanal()
+        return None
+
+    elif cmd == "/scan":
+        return "SCAN_SOLICITADO"
+
+    elif cmd == "/debug":
+        return "DEBUG_SOLICITADO"
+
+    elif cmd == "/bloquear":
+        if len(partes) < 2:
+            return "❌ Formato: /bloquear ATIVO [motivo]"
+        ativo  = partes[1].upper()
+        motivo = " ".join(partes[2:]) if len(partes) > 2 else "Manual"
+        adicionar_blacklist(ativo, motivo)
+        return f"🚫 {ativo} adicionado à blacklist\nMotivo: {motivo}"
+
+    elif cmd == "/desbloquear":
+        if len(partes) < 2:
+            return "❌ Formato: /desbloquear ATIVO"
+        remover_blacklist(partes[1].upper())
+        return f"✅ {partes[1].upper()} removido da blacklist"
+
+    elif cmd == "/blacklist":
+        bl = get_blacklist()
+        if not bl:
+            return "📋 Blacklist vazia"
+        return "🚫 <b>Blacklist</b>\n" + "\n".join(f"  • {a}" for a in sorted(bl))
+
+    elif cmd == "/ativos":
+        linhas = ["📡 <b>Ativos — Multi-Exchange</b>\n"]
+        total  = 0
+        for ex in EXCHANGES_CONFIG:
+            if ex["instance"]:
+                n = len([m for m in ex["instance"].markets.values()
+                         if m.get("active") and m.get("quote") in ["USDT","USDC"]])
+                linhas.append(f"  ✅ {ex['label']}: {n} ativos")
+                total += n
+            else:
+                linhas.append(f"  ❌ {ex['label']}: offline")
+        linhas += [f"\n📊 Total: {total}", f"⏱ TF: 15M | Vol >5x | RSI <40 ou >60"]
+        return "\n".join(linhas)
+
+    elif cmd == "/status":
+        brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
+        ex_online = sum(1 for ex in EXCHANGES_CONFIG if ex["instance"])
+        return (
+            f"✅ <b>LucSharkTrade v12 ONLINE</b>\n"
+            f"🕐 {brt}\n"
+            f"📡 Exchanges: {ex_online}/3 online\n"
+            f"💰 Capital: ${CAPITAL_INICIAL:,.2f}"
+        )
+
+    return None
+
 def main():
     init_db()
+    init_exchanges()
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     enviar_telegram(
-        f"🚀 <b>LucSharkTrade v11 ONLINE!</b>\n"
+        f"🚀 <b>LucSharkTrade v12 ONLINE!</b>\n"
         f"📅 {brt}\n\n"
-        f"✅ Scanner 15M ativo\n"
-        f"✅ 3 níveis: FORTE ({MULT_FORTE}x) | MÉDIO ({MULT_MEDIO}x) | ALERTA ({MULT_ALERTA}x)\n"
+        f"✅ Scanner 15M — Multi-Exchange (LBank+Binance+Bybit)\n"
+        f"✅ Sentimento agregado via Coinalyze\n"
+        f"✅ Score de qualidade 0-100\n"
         f"✅ Monitoramento de trades 24/7\n\n"
         f"Envie /ajuda para ver os comandos."
     )
@@ -1239,11 +1540,16 @@ def main():
 
         monitorar_trades()
 
-        # Relatório diário automático às 18h BRT
+        # Relatórios automáticos
         agora_brt = brt_agora()
+        # Diário às 18h
         if agora_brt.hour == 18 and agora_brt.minute == 0:
             relatorio_diario()
-            time.sleep(60)  # evitar duplo envio no mesmo minuto
+            time.sleep(60)
+        # Semanal segunda-feira às 9h
+        if agora_brt.weekday() == 0 and agora_brt.hour == 9 and agora_brt.minute == 0:
+            relatorio_semanal()
+            time.sleep(60)
 
         time.sleep(INTERVALO_SEG)
 
