@@ -1650,27 +1650,29 @@ def processar_comando(texto):
         return None
 
     elif cmd == "/parar":
-        # Limpa o backlog do Telegram — para qualquer loop em andamento
+        # Limpa TODO o backlog do Telegram — busca até 100 mensagens e confirma
         try:
-            r = requests.get(
+            resultado_flush = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params={"offset": -1, "limit": 1},
+                params={"offset": 0, "limit": 100, "timeout": 0},
                 timeout=10
-            )
-            result = r.json().get("result", [])
-            if result:
-                novo_offset = result[-1]["update_id"] + 1
-                # Confirmar offset avançado
+            ).json()
+            pendentes = resultado_flush.get("result", [])
+            if pendentes:
+                novo_offset = pendentes[-1]["update_id"] + 1
+                # Confirmar offset — descarta tudo
                 requests.get(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                    params={"offset": novo_offset, "limit": 1},
+                    params={"offset": novo_offset, "limit": 1, "timeout": 0},
                     timeout=10
                 )
+                n = len(pendentes)
+            else:
+                n = 0
             enviar_telegram(
-                "🛑 <b>PARAR executado</b>\n"
-                "✅ Fila de comandos limpa\n"
-                "✅ Loop interrompido\n"
-                "Bot aguardando novos comandos."
+                f"🛑 <b>PARAR executado</b>\n"
+                f"✅ {n} mensagens pendentes descartadas\n"
+                f"✅ Fila limpa — bot aguardando novos comandos."
             )
         except Exception as e:
             enviar_telegram(f"Erro ao parar: {e}")
@@ -1737,15 +1739,33 @@ def main():
     log.info("Flask API iniciado")
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     # Evitar mensagem duplicada em restarts rápidos
-    import os, pathlib
-    lock_file = "/tmp/lucshark_started.lock"
-    lock_age  = 0
-    if pathlib.Path(lock_file).exists():
-        lock_age = time.time() - pathlib.Path(lock_file).stat().st_mtime
-    
-    if lock_age > 300 or not pathlib.Path(lock_file).exists():
-        # Só envia se passou mais de 5 minutos do último start
-        pathlib.Path(lock_file).touch()
+    # Usa o DB (persistente no Railway) em vez de /tmp (efêmero)
+    try:
+        conn_s = sqlite3.connect("trades.db")
+        cs = conn_s.cursor()
+        cs.execute("""
+            CREATE TABLE IF NOT EXISTS sistema_log (
+                chave TEXT PRIMARY KEY,
+                valor TEXT,
+                criado_em TEXT
+            )
+        """)
+        cs.execute("SELECT valor FROM sistema_log WHERE chave='ultimo_start'")
+        row = cs.fetchone()
+        agora_ts = time.time()
+        enviar_online = True
+        if row:
+            ultimo_start = float(row[0])
+            if agora_ts - ultimo_start < 300:  # menos de 5 minutos
+                enviar_online = False
+        cs.execute("INSERT OR REPLACE INTO sistema_log VALUES ('ultimo_start', ?, ?)",
+                   (str(agora_ts), brt))
+        conn_s.commit()
+        conn_s.close()
+    except:
+        enviar_online = True
+
+    if enviar_online:
         enviar_telegram(
             f"🚀 <b>LucSharkTrade v12 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
@@ -1838,5 +1858,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
