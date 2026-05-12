@@ -1108,14 +1108,15 @@ def monitorar_trades():
 
         if direcao == "LONG":
 
-            # ── ALERTA 1: Preço se aproximando da zona de entrada ──
-            if preco <= entrada * 1.03 and not alerta_ja_enviado(f"{base}_zona"):
+            # ── ALERTA 1: Preço se aproximando da zona de entrada (apenas se acima da entrada) ──
+            distancia_pct = (preco - entrada) / entrada * 100
+            if 0 < distancia_pct <= 3.0 and not alerta_ja_enviado(f"{base}_zona"):
                 marcar_alerta(f"{base}_zona")
                 enviar_telegram(
                     f"👀 <b>ZONA DE ENTRADA — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | Entrada: ${entrada}\n"
-                    f"📍 Preço a {round((preco/entrada-1)*100,2)}% da entrada\n"
-                    f"⏳ Aguardando acionamento..."
+                    f"📍 Preço a {round(distancia_pct,2)}% acima da entrada\n"
+                    f"⏳ Aguardando pullback para acionar..."
                 )
 
             # ── ALERTA 2: Preço na entrada exata ──
@@ -1177,14 +1178,15 @@ def monitorar_trades():
 
         elif direcao == "SHORT":
 
-            # ── ALERTA 1: Preço se aproximando da zona de entrada ──
-            if preco >= entrada * 0.97 and not alerta_ja_enviado(f"{base}_zona"):
+            # ── ALERTA 1: Preço se aproximando da zona de entrada (apenas se abaixo da entrada) ──
+            distancia_pct = (entrada - preco) / entrada * 100
+            if 0 < distancia_pct <= 3.0 and not alerta_ja_enviado(f"{base}_zona"):
                 marcar_alerta(f"{base}_zona")
                 enviar_telegram(
                     f"👀 <b>ZONA DE ENTRADA — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | Entrada: ${entrada}\n"
-                    f"📍 Preço a {round((1-preco/entrada)*100,2)}% da entrada\n"
-                    f"⏳ Aguardando acionamento..."
+                    f"📍 Preço a {round(distancia_pct,2)}% abaixo da entrada\n"
+                    f"⏳ Aguardando subida para acionar..."
                 )
 
             # ── ALERTA 2: Preço na entrada exata ──
@@ -1425,6 +1427,126 @@ def api_stats():
 def health():
     return jsonify({"status": "online", "version": "v12"})
 
+@flask_app.route("/")
+@flask_app.route("/dashboard")
+def dashboard():
+    """Dashboard HTML embutido no bot."""
+    return """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LucSharkTrade Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0e1117; color:#fff; font-family:Arial,sans-serif; padding:20px; }
+  h1 { color:#00d4aa; margin-bottom:20px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:16px; margin-bottom:24px; }
+  .card { background:#1e2130; border-radius:12px; padding:20px; text-align:center; border:1px solid #2d3250; }
+  .card-val { font-size:2rem; font-weight:bold; color:#00d4aa; }
+  .card-val.red { color:#ff4b4b; }
+  .card-val.orange { color:#ffa500; }
+  .card-label { font-size:0.85rem; color:#aaa; margin-top:4px; }
+  .charts { display:grid; grid-template-columns:2fr 1fr; gap:16px; margin-bottom:24px; }
+  .chart-box { background:#1e2130; border-radius:12px; padding:20px; }
+  table { width:100%; border-collapse:collapse; background:#1e2130; border-radius:12px; overflow:hidden; }
+  th { background:#1b3a6b; padding:12px; text-align:left; font-size:0.85rem; }
+  td { padding:10px 12px; border-bottom:1px solid #2d3250; font-size:0.85rem; }
+  tr:hover { background:#252840; }
+  .win { color:#00d4aa; font-weight:bold; }
+  .loss { color:#ff4b4b; font-weight:bold; }
+  .open { color:#ffa500; }
+  .refresh { color:#aaa; font-size:0.8rem; margin-bottom:16px; }
+  @media(max-width:600px){ .charts{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<h1>🦈 LucSharkTrade Dashboard</h1>
+<p class="refresh" id="refresh-time">Carregando...</p>
+<div class="cards" id="cards"></div>
+<div class="charts">
+  <div class="chart-box"><canvas id="capitalChart"></canvas></div>
+  <div class="chart-box"><canvas id="pieChart"></canvas></div>
+</div>
+<table>
+  <thead><tr><th>#</th><th>Data</th><th>Ativo</th><th>Dir</th><th>Entrada</th><th>Stop</th><th>A1</th><th>A2</th><th>A3</th><th>Resultado</th><th>P&L</th></tr></thead>
+  <tbody id="trades-body"></tbody>
+</table>
+<script>
+function pnl(res) {
+  if(!res) return 0;
+  if(res.includes('A3')) return 60;
+  if(res.includes('A2')) return 40;
+  if(res.startsWith('WIN')) return 20;
+  if(res==='LOSS') return -20;
+  return 0;
+}
+function colorRes(res) {
+  if(!res||res==='ABERTO') return 'open';
+  if(res.startsWith('WIN')) return 'win';
+  if(res==='LOSS') return 'loss';
+  return '';
+}
+async function loadData() {
+  const [tradesResp, statsResp] = await Promise.all([
+    fetch('/api/trades').then(r=>r.json()).catch(()=>({trades:[]})),
+    fetch('/api/stats').then(r=>r.json()).catch(()=>({}))
+  ]);
+  const trades = tradesResp.trades || [];
+  const stats  = statsResp;
+
+  // Cards
+  document.getElementById('cards').innerHTML = `
+    <div class="card"><div class="card-val">${stats.total||0}</div><div class="card-label">Total Trades</div></div>
+    <div class="card"><div class="card-val">${stats.wins||0}</div><div class="card-label">✅ Wins</div></div>
+    <div class="card"><div class="card-val red">${stats.losses||0}</div><div class="card-label">❌ Losses</div></div>
+    <div class="card"><div class="card-val orange">${stats.abertos||0}</div><div class="card-label">🔄 Abertos</div></div>
+    <div class="card"><div class="card-val">${(stats.win_rate||0).toFixed(1)}%</div><div class="card-label">🎯 Win Rate</div></div>
+    <div class="card"><div class="card-val ${(stats.pnl||0)>=0?'':'red'}">${(stats.pnl||0)>=0?'+':''}$${(stats.pnl||0).toFixed(2)}</div><div class="card-label">💰 P&L | $${(stats.capital||1000).toFixed(2)}</div></div>
+  `;
+
+  // Curva de capital
+  const sorted = [...trades].sort((a,b)=>a.id-b.id);
+  let cap = 1000;
+  const caps = sorted.map(t=>{ cap+=pnl(t.resultado); return cap; });
+  new Chart(document.getElementById('capitalChart'), {
+    type:'line',
+    data:{ labels:sorted.map((_,i)=>i+1), datasets:[{ label:'Capital', data:caps,
+      borderColor:'#00d4aa', backgroundColor:'rgba(0,212,170,0.1)', fill:true, tension:0.3 }] },
+    options:{ plugins:{legend:{display:false}}, scales:{y:{ticks:{callback:v=>'$'+v}}},
+      responsive:true, maintainAspectRatio:true }
+  });
+
+  // Pizza
+  new Chart(document.getElementById('pieChart'), {
+    type:'doughnut',
+    data:{ labels:['Wins','Losses','Abertos'],
+      datasets:[{ data:[stats.wins||0,stats.losses||0,stats.abertos||0],
+        backgroundColor:['#00d4aa','#ff4b4b','#ffa500'] }] },
+    options:{ plugins:{legend:{position:'bottom',labels:{color:'#fff'}}}, responsive:true }
+  });
+
+  // Tabela
+  const tbody = document.getElementById('trades-body');
+  tbody.innerHTML = trades.map(t=>`<tr>
+    <td>${t.id}</td><td>${(t.criado_em||'').slice(0,10)}</td>
+    <td><b>${t.ativo}</b></td>
+    <td style="color:${t.direcao==='LONG'?'#00d4aa':'#ff4b4b'}">${t.direcao}</td>
+    <td>$${t.entrada}</td><td>$${t.stop}</td>
+    <td>$${t.a1}</td><td>$${t.a2}</td><td>$${t.a3}</td>
+    <td class="${colorRes(t.resultado)}">${t.resultado||'ABERTO'}</td>
+    <td class="${pnl(t.resultado)>=0?'win':'loss'}">${pnl(t.resultado)>=0?'+':''}$${pnl(t.resultado)}</td>
+  </tr>`).join('');
+
+  document.getElementById('refresh-time').textContent =
+    'Atualizado: ' + new Date().toLocaleTimeString('pt-BR') + ' BRT | Auto-refresh em 30s';
+}
+loadData();
+setInterval(loadData, 30000);
+</script>
+</body></html>"""
+
 def iniciar_flask():
     """Roda o Flask em thread separada para não bloquear o bot."""
     port = int(os.environ.get("PORT", 8080))
@@ -1581,15 +1703,25 @@ def main():
     flask_thread.start()
     log.info("Flask API iniciado")
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
-    enviar_telegram(
-        f"🚀 <b>LucSharkTrade v12 ONLINE!</b>\n"
-        f"📅 {brt}\n\n"
-        f"✅ Scanner 15M — Multi-Exchange (LBank+Binance+Bybit)\n"
-        f"✅ Sentimento agregado via Coinalyze\n"
-        f"✅ Score de qualidade 0-100\n"
-        f"✅ Monitoramento de trades 24/7\n\n"
-        f"Envie /ajuda para ver os comandos."
-    )
+    # Evitar mensagem duplicada em restarts rápidos
+    import os, pathlib
+    lock_file = "/tmp/lucshark_started.lock"
+    lock_age  = 0
+    if pathlib.Path(lock_file).exists():
+        lock_age = time.time() - pathlib.Path(lock_file).stat().st_mtime
+    
+    if lock_age > 300 or not pathlib.Path(lock_file).exists():
+        # Só envia se passou mais de 5 minutos do último start
+        pathlib.Path(lock_file).touch()
+        enviar_telegram(
+            f"🚀 <b>LucSharkTrade v12 ONLINE!</b>\n"
+            f"📅 {brt}\n\n"
+            f"✅ Scanner 15M — Multi-Exchange (LBank+Binance+Bybit)\n"
+            f"✅ Sentimento agregado via Coinalyze\n"
+            f"✅ Score de qualidade 0-100\n"
+            f"✅ Monitoramento de trades 24/7\n\n"
+            f"Envie /ajuda para ver os comandos."
+        )
 
     ultimo_offset = None
 
