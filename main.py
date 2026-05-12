@@ -56,6 +56,13 @@ def init_db():
             criado_em TEXT
         )
     """)
+    # Controle persistente de alertas — evita duplicatas mesmo após restart
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS alertas_log (
+            chave TEXT PRIMARY KEY,
+            criado_em TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -935,8 +942,37 @@ def buscar_preco_atual(ativo):
             }
     return None
 
-# Controle de alertas já enviados (evita duplicatas no mesmo ciclo)
-_alertas_enviados = {}
+# Controle de alertas persistente (sobrevive a restarts do bot)
+_alertas_enviados = {}  # cache em memória para performance
+
+def alerta_ja_enviado(chave):
+    """Verifica se alerta já foi enviado — memória primeiro, DB como fallback."""
+    if chave in _alertas_enviados:
+        return True
+    try:
+        conn = sqlite3.connect("trades.db")
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM alertas_log WHERE chave=?", (chave,))
+        existe = c.fetchone() is not None
+        conn.close()
+        if existe:
+            _alertas_enviados[chave] = True  # popular cache
+        return existe
+    except:
+        return False
+
+def marcar_alerta(chave):
+    """Registra alerta como enviado em memória e no DB."""
+    _alertas_enviados[chave] = True
+    try:
+        conn = sqlite3.connect("trades.db")
+        c = conn.cursor()
+        agora = brt_agora().strftime("%Y-%m-%d %H:%M")
+        c.execute("INSERT OR IGNORE INTO alertas_log VALUES (?,?)", (chave, agora))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error(f"marcar_alerta {chave}: {e}")
 
 def calcular_duracao(criado_em):
     """Calcula duração do trade desde a abertura."""
@@ -967,70 +1003,76 @@ def monitorar_trades():
 
         dados = buscar_preco_atual(ativo)
         if not dados:
-            log.warning(f"Sem preço para {ativo}")
+            log.warning(f"Sem preco para {ativo}")
             continue
 
         preco = dados["preco"]
         high  = dados["high"]
         low   = dados["low"]
 
-        # Tolerância de 1% para não perder movimentos rápidos
-        tol = entrada * 0.01
-
-        chave_base = f"{tid}_{ativo}"
+        base   = f"{tid}_{ativo}"
+        # Tolerâncias
+        tol_zona   = entrada * 0.02   # 2% — alerta de aproximação da zona
+        tol_entrada = entrada * 0.003  # 0.3% — alerta de entrada exata
 
         if direcao == "LONG":
-            # Entrada acionada
-            chave_entrada = f"{chave_base}_entrada"
-            if abs(preco - entrada) <= tol and chave_entrada not in _alertas_enviados:
-                _alertas_enviados[chave_entrada] = True
+
+            # ── ALERTA 1: Preço se aproximando da zona de entrada ──
+            if preco <= entrada * 1.03 and not alerta_ja_enviado(f"{base}_zona"):
+                marcar_alerta(f"{base}_zona")
                 enviar_telegram(
-                    f"🟢 <b>ENTRADA LONG — {ativo}</b>\n"
+                    f"👀 <b>ZONA DE ENTRADA — {ativo} LONG #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | Entrada: ${entrada}\n"
+                    f"📍 Preço a {round((preco/entrada-1)*100,2)}% da entrada\n"
+                    f"⏳ Aguardando acionamento..."
+                )
+
+            # ── ALERTA 2: Preço na entrada exata ──
+            elif abs(preco - entrada) <= tol_entrada and not alerta_ja_enviado(f"{base}_entrada"):
+                marcar_alerta(f"{base}_entrada")
+                enviar_telegram(
+                    f"🟢 <b>ENTRADA LONG — {ativo} #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g}\n"
                     f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
                     f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
                 )
-            # A3 atingido (verificar do maior para o menor)
-            elif high >= a3 and f"{chave_base}_a3" not in _alertas_enviados:
-                _alertas_enviados[f"{chave_base}_a3"] = True
+
+            # ── ALVOS (do maior para o menor) ──
+            elif high >= a3 and not alerta_ja_enviado(f"{base}_a3"):
+                marcar_alerta(f"{base}_a3")
                 atualizar_resultado(ativo, "WIN_A3")
                 duracao = calcular_duracao(criado)
                 enviar_telegram(
                     f"🏆 <b>A3 ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
-                    f"✅ Realizar 80% da posição\n"
-                    f"🎉 Trailing Stop ativo no restante!\n"
+                    f"✅ Realizar 80% | 🎉 Trailing Stop no restante\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📋 <b>RESUMO DO TRADE</b>\n"
-                    f"Entrada: ${entrada} → A1: ${a1} → A2: ${a2} → A3: ${a3}\n"
-                    f"Resultado: ✅ WIN A3 (RR 3:1)\n"
-                    f"Duração: {duracao}"
+                    f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
+                    f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
                 )
-            # A2 atingido
-            elif high >= a2 and f"{chave_base}_a2" not in _alertas_enviados:
-                _alertas_enviados[f"{chave_base}_a2"] = True
+
+            elif high >= a2 and not alerta_ja_enviado(f"{base}_a2"):
+                marcar_alerta(f"{base}_a2")
                 atualizar_resultado(ativo, "WIN_A2")
                 enviar_telegram(
                     f"🎯 <b>A2 ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
-                    f"✅ Realizar 50% da posição\n"
-                    f"⏳ Aguardar A3: ${a3}"
+                    f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
                 )
-            # A1 atingido
-            elif high >= a1 and f"{chave_base}_a1" not in _alertas_enviados:
-                _alertas_enviados[f"{chave_base}_a1"] = True
+
+            elif high >= a1 and not alerta_ja_enviado(f"{base}_a1"):
+                marcar_alerta(f"{base}_a1")
                 atualizar_resultado(ativo, "WIN_A1")
                 enviar_telegram(
                     f"🎯 <b>A1 ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
-                    f"✅ Realizar 25% da posição\n"
-                    f"🔒 Mover Stop para entrada ${entrada} (breakeven)\n"
-                    f"⏰ Lembrete em 5 min: confirme o breakeven!\n"
+                    f"✅ Realizar 25%\n"
+                    f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
-            # Stop atingido
-            elif low <= stop and f"{chave_base}_stop" not in _alertas_enviados:
-                _alertas_enviados[f"{chave_base}_stop"] = True
+
+            elif low <= stop and not alerta_ja_enviado(f"{base}_stop"):
+                marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
                 duracao = calcular_duracao(criado)
                 enviar_telegram(
@@ -1038,64 +1080,68 @@ def monitorar_trades():
                     f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
                     f"❌ Sair imediatamente!\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📋 <b>RESUMO DO TRADE</b>\n"
-                    f"Entrada: ${entrada} | Saída: ${preco:.6g}\n"
-                    f"Resultado: ❌ LOSS\n"
-                    f"Duração: {duracao}"
+                    f"📋 Entrada: ${entrada} | Saída: ${preco:.6g}\n"
+                    f"❌ LOSS | ⏱ {duracao}"
                 )
 
         elif direcao == "SHORT":
-            # Entrada acionada
-            chave_entrada = f"{chave_base}_entrada"
-            if abs(preco - entrada) <= tol and chave_entrada not in _alertas_enviados:
-                _alertas_enviados[chave_entrada] = True
+
+            # ── ALERTA 1: Preço se aproximando da zona de entrada ──
+            if preco >= entrada * 0.97 and not alerta_ja_enviado(f"{base}_zona"):
+                marcar_alerta(f"{base}_zona")
                 enviar_telegram(
-                    f"🔴 <b>ENTRADA SHORT — {ativo}</b>\n"
+                    f"👀 <b>ZONA DE ENTRADA — {ativo} SHORT #{tid}</b>\n"
+                    f"💲 Preço: ${preco:.6g} | Entrada: ${entrada}\n"
+                    f"📍 Preço a {round((1-preco/entrada)*100,2)}% da entrada\n"
+                    f"⏳ Aguardando acionamento..."
+                )
+
+            # ── ALERTA 2: Preço na entrada exata ──
+            elif abs(preco - entrada) <= tol_entrada and not alerta_ja_enviado(f"{base}_entrada"):
+                marcar_alerta(f"{base}_entrada")
+                enviar_telegram(
+                    f"🔴 <b>ENTRADA SHORT — {ativo} #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g}\n"
                     f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
                     f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
                 )
-            # A3 atingido (verificar do maior para o menor)
-            elif low <= a3 and f"{chave_base}_a3" not in _alertas_enviados:
-                _alertas_enviados[f"{chave_base}_a3"] = True
+
+            # ── ALVOS (do maior para o menor) ──
+            elif low <= a3 and not alerta_ja_enviado(f"{base}_a3"):
+                marcar_alerta(f"{base}_a3")
                 atualizar_resultado(ativo, "WIN_A3")
                 duracao = calcular_duracao(criado)
                 enviar_telegram(
                     f"🏆 <b>A3 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
-                    f"✅ Realizar 80% da posição\n"
-                    f"🎉 Trailing Stop ativo no restante!\n"
+                    f"✅ Realizar 80% | 🎉 Trailing Stop no restante\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📋 <b>RESUMO DO TRADE</b>\n"
-                    f"Entrada: ${entrada} → A1: ${a1} → A2: ${a2} → A3: ${a3}\n"
-                    f"Resultado: ✅ WIN A3 (RR 3:1)\n"
-                    f"Duração: {duracao}"
+                    f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
+                    f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
                 )
-            # A2 atingido
-            elif low <= a2 and f"{chave_base}_a2" not in _alertas_enviados:
-                _alertas_enviados[f"{chave_base}_a2"] = True
+
+            elif low <= a2 and not alerta_ja_enviado(f"{base}_a2"):
+                marcar_alerta(f"{base}_a2")
                 atualizar_resultado(ativo, "WIN_A2")
                 enviar_telegram(
                     f"🎯 <b>A2 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
-                    f"✅ Realizar 50% da posição\n"
-                    f"⏳ Aguardar A3: ${a3}"
+                    f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
                 )
-            # A1 atingido
-            elif low <= a1 and f"{chave_base}_a1" not in _alertas_enviados:
-                _alertas_enviados[f"{chave_base}_a1"] = True
+
+            elif low <= a1 and not alerta_ja_enviado(f"{base}_a1"):
+                marcar_alerta(f"{base}_a1")
                 atualizar_resultado(ativo, "WIN_A1")
                 enviar_telegram(
                     f"🎯 <b>A1 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
-                    f"✅ Realizar 25% da posição\n"
-                    f"🔒 Mover Stop para entrada ${entrada} (breakeven)\n"
-                    f"⏰ Lembrete em 5 min: confirme o breakeven!\n"
+                    f"✅ Realizar 25%\n"
+                    f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
-            # Stop atingido
-            elif high >= stop and f"{chave_base}_stop" not in _alertas_enviados:
-                _alertas_enviados[f"{chave_base}_stop"] = True
+
+            elif high >= stop and not alerta_ja_enviado(f"{base}_stop"):
+                marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
                 duracao = calcular_duracao(criado)
                 enviar_telegram(
@@ -1103,135 +1149,11 @@ def monitorar_trades():
                     f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
                     f"❌ Sair imediatamente!\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📋 <b>RESUMO DO TRADE</b>\n"
-                    f"Entrada: ${entrada} | Saída: ${preco:.6g}\n"
-                    f"Resultado: ❌ LOSS\n"
-                    f"Duração: {duracao}"
+                    f"📋 Entrada: ${entrada} | Saída: ${preco:.6g}\n"
+                    f"❌ LOSS | ⏱ {duracao}"
                 )
 
-# ─────────────────────────────────────────────
-# COMANDOS DO TELEGRAM
-# ─────────────────────────────────────────────
-def processar_comando(texto):
-    partes = texto.strip().split()
-    cmd = partes[0].lower()
 
-    if cmd in ["/start", "/ajuda"]:
-        return (
-            "🤖 <b>LucSharkTrade v11 — Comandos</b>\n\n"
-            "<b>📊 TRADES</b>\n"
-            "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
-            "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
-            "/trades — trades abertos\n"
-            "/relatorio — estatísticas e P&L\n\n"
-            "<b>🔍 SCANNER</b>\n"
-            "/scan — rodar scanner agora\n"
-            "/ativos — total de ativos monitorados\n\n"
-            "<b>🚫 BLACKLIST</b>\n"
-            "/bloquear ATIVO [motivo] — ignorar no scanner\n"
-            "/desbloquear ATIVO — remover da blacklist\n"
-            "/blacklist — ver ativos bloqueados\n\n"
-            "<b>⚙️ SISTEMA</b>\n"
-            "/status — status do bot\n"
-            "/debug — diagnóstico da API\n"
-            "/ajuda — este menu"
-        )
-
-    elif cmd == "/trade":
-        if len(partes) < 10:
-            return "❌ Formato: /trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT"
-        try:
-            ativo, direcao = partes[1].upper(), partes[2].upper()
-            entrada, stop  = float(partes[3]), float(partes[4])
-            a1, a2, a3     = float(partes[5]), float(partes[6]), float(partes[7])
-            tf_ctx, tf_ent = partes[8], partes[9]
-            tid = salvar_trade(ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent)
-            return (
-                f"✅ <b>Trade #{tid} cadastrado!</b>\n"
-                f"📊 {ativo} {direcao}\n"
-                f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
-                f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}\n"
-                f"⏱ {tf_ctx} / {tf_ent} | 🔄 Monitorando 24/7..."
-            )
-        except Exception as e:
-            return f"❌ Erro: {e}"
-
-    elif cmd == "/resultado":
-        if len(partes) < 3:
-            return "❌ Formato: /resultado ATIVO WIN_A1 | LOSS"
-        ativo = partes[1].upper()
-        res   = " ".join(partes[2:]).upper()
-        atualizar_resultado(ativo, res)
-        return f"✅ {ativo} → {res}"
-
-    elif cmd == "/trades":
-        rows = listar_trades()
-        if not rows:
-            return "📭 Nenhum trade registrado."
-        linhas = ["📊 <b>Últimos Trades</b>\n"]
-        for r in rows:
-            tid, ativo, direcao, entrada, stop, a1, a2, a3, _, _, resultado, criado = r
-            emoji = "🟢" if direcao == "LONG" else "🔴"
-            linhas.append(f"{emoji} #{tid} {ativo} {direcao} ${entrada} → {resultado} ({criado})")
-        return "\n".join(linhas)
-
-    elif cmd == "/relatorio":
-        total, wins, loss, abertos, wr = relatorio()
-        return (
-            f"📈 <b>Relatório LucSharkTrade</b>\n\n"
-            f"Total: {total} | ✅ {wins} | ❌ {loss} | 🔄 {abertos}\n"
-            f"🎯 Win Rate: {wr:.1f}%"
-        )
-
-    elif cmd == "/scan":
-        return "SCAN_SOLICITADO"
-
-    elif cmd == "/bloquear":
-        if len(partes) < 2:
-            return "❌ Formato: /bloquear ATIVO [motivo]"
-        ativo  = partes[1].upper()
-        motivo = " ".join(partes[2:]) if len(partes) > 2 else "Manual"
-        adicionar_blacklist(ativo, motivo)
-        return f"🚫 {ativo} adicionado à blacklist\nMotivo: {motivo}"
-
-    elif cmd == "/desbloquear":
-        if len(partes) < 2:
-            return "❌ Formato: /desbloquear ATIVO"
-        ativo = partes[1].upper()
-        remover_blacklist(ativo)
-        return f"✅ {ativo} removido da blacklist"
-
-    elif cmd == "/blacklist":
-        bl = get_blacklist()
-        if not bl:
-            return "📋 Blacklist vazia"
-        return "🚫 <b>Blacklist</b>\n" + "\n".join(f"  • {a}" for a in sorted(bl))
-
-    elif cmd == "/debug":
-        return "DEBUG_SOLICITADO"
-
-    elif cmd == "/ativos":
-        tickers  = buscar_ticker_24h()
-        pares    = buscar_todos_pares()
-        validos  = sum(1 for p in pares
-                       if tickers.get(p) and float(tickers[p].get("turnover", 0)) >= MIN_VOLUME_24H)
-        return (
-            f"📡 <b>Ativos Monitorados</b>\n\n"
-            f"Total LBank: {len(pares)}\n"
-            f"Com volume ≥ ${MIN_VOLUME_24H:,.0f}: {validos}\n"
-            f"Timeframe: 15M\n"
-            f"FORTE ≥{MULT_FORTE}x | MÉDIO ≥{MULT_MEDIO}x | ALERTA ≥{MULT_ALERTA}x"
-        )
-
-    elif cmd == "/status":
-        brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
-        return f"✅ <b>Bot ONLINE</b>\n🕐 {brt}\n💰 Capital: ${CAPITAL_INICIAL:,.2f}"
-
-    return None
-
-# ─────────────────────────────────────────────
-# LOOP PRINCIPAL
-# ─────────────────────────────────────────────
 def relatorio_diario():
     """Relatório automático diário às 18h BRT."""
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
