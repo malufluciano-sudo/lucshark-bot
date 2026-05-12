@@ -3,3 +3,5 @@ requests==2.31.0
 pandas==2.1.4
 numpy==1.26.4
 ccxt==4.3.91
+streamlit==1.33.0
+plotly==5.22.0
