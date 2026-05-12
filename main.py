@@ -1726,11 +1726,35 @@ def main():
     ultimo_offset = None
 
     while True:
-        updates = get_updates(ultimo_offset)
+        try:
+            updates = get_updates(ultimo_offset)
+        except Exception as e:
+            log.error(f"get_updates erro: {e}")
+            time.sleep(5)
+            continue
+
         for upd in updates:
-            ultimo_offset = upd["update_id"] + 1
-            texto = upd.get("message", {}).get("text", "")
-            if texto.startswith("/"):
+            update_id = upd.get("update_id")
+            if update_id is None:
+                continue
+            # Avançar offset ANTES de processar — evita reprocessamento
+            ultimo_offset = update_id + 1
+
+            msg   = upd.get("message", {})
+            texto = msg.get("text", "")
+
+            # Ignorar mensagens vazias ou não-comandos
+            if not texto or not texto.startswith("/"):
+                continue
+
+            # Ignorar mensagens antigas (> 60 segundos)
+            msg_date = msg.get("date", 0)
+            if msg_date and (time.time() - msg_date) > 60:
+                log.debug(f"Mensagem antiga ignorada: {texto}")
+                continue
+
+            log.info(f"Comando recebido: {texto}")
+            try:
                 resposta = processar_comando(texto)
                 if resposta == "SCAN_SOLICITADO":
                     enviar_telegram("🔍 Scanner iniciado manualmente...")
@@ -1739,6 +1763,8 @@ def main():
                     rodar_scanner_debug()
                 elif resposta:
                     enviar_telegram(resposta)
+            except Exception as e:
+                log.error(f"Erro processando comando {texto}: {e}")
 
         monitorar_trades()
 
