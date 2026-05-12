@@ -139,9 +139,14 @@ def enviar_telegram(msg):
 
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"timeout": 30, "offset": offset}
+    params = {
+        "timeout": 25,
+        "offset": offset,
+        "limit": 10,
+        "allowed_updates": ["message"]  # Só mensagens de texto — ignora outros eventos
+    }
     try:
-        r = requests.get(url, params=params, timeout=35)
+        r = requests.get(url, params=params, timeout=30)
         return r.json().get("result", [])
     except:
         return []
@@ -1573,6 +1578,7 @@ def processar_comando(texto):
             "/desbloquear ATIVO\n"
             "/blacklist — ver bloqueados\n\n"
             "<b>⚙️ SISTEMA</b>\n"
+            "/parar — limpar fila e parar loop\n"
             "/status — status do bot\n"
             "/debug — diagnóstico da API\n"
             "/ajuda — este menu"
@@ -1641,6 +1647,33 @@ def processar_comando(texto):
 
     elif cmd == "/semana":
         relatorio_semanal()
+        return None
+
+    elif cmd == "/parar":
+        # Limpa o backlog do Telegram — para qualquer loop em andamento
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": -1, "limit": 1},
+                timeout=10
+            )
+            result = r.json().get("result", [])
+            if result:
+                novo_offset = result[-1]["update_id"] + 1
+                # Confirmar offset avançado
+                requests.get(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                    params={"offset": novo_offset, "limit": 1},
+                    timeout=10
+                )
+            enviar_telegram(
+                "🛑 <b>PARAR executado</b>\n"
+                "✅ Fila de comandos limpa\n"
+                "✅ Loop interrompido\n"
+                "Bot aguardando novos comandos."
+            )
+        except Exception as e:
+            enviar_telegram(f"Erro ao parar: {e}")
         return None
 
     elif cmd == "/scan":
@@ -1723,7 +1756,29 @@ def main():
             f"Envie /ajuda para ver os comandos."
         )
 
+    # ── Descartar TODAS as mensagens pendentes antes de iniciar ──
     ultimo_offset = None
+    try:
+        # Buscar todas as pendentes com limit alto
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"offset": 0, "limit": 100, "timeout": 0},
+            timeout=10
+        ).json()
+        pending = r.get("result", [])
+        if pending:
+            # Confirmar offset do último — descarta tudo
+            ultimo_offset = pending[-1]["update_id"] + 1
+            # Confirmar no Telegram
+            requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": ultimo_offset, "limit": 1, "timeout": 0},
+                timeout=10
+            )
+            log.info(f"Descartadas {len(pending)} mensagens pendentes. Offset: {ultimo_offset}")
+    except Exception as e:
+        log.warning(f"Erro ao descartar pendentes: {e}")
+        ultimo_offset = None
 
     while True:
         try:
