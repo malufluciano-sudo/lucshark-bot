@@ -15,6 +15,8 @@ TOLERANCIA_PCT   = float(os.environ.get("TOLERANCIA_PCT", "0.005"))
 INTERVALO_SEG    = int(os.environ.get("INTERVALO_SEG", "30"))
 INTERVALO_SCAN   = int(os.environ.get("INTERVALO_SCAN", "3600"))
 MIN_VOLUME_24H   = float(os.environ.get("MIN_VOLUME_24H", "100000"))
+COINALYZE_KEY   = os.environ.get("COINALYZE_KEY", "376762b9-d136-4457-a192-9cd0a7865d43")
+COINALYZE_BASE  = "https://api.coinalyze.net/v1"
 
 # ── Parâmetros do scanner ──
 TIMEFRAME_SCAN     = "minute15"  # official LBank value
@@ -44,6 +46,13 @@ def init_db():
             a1 REAL, a2 REAL, a3 REAL,
             tf_ctx TEXT, tf_ent TEXT,
             resultado TEXT DEFAULT 'ABERTO',
+            criado_em TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS blacklist (
+            ativo TEXT PRIMARY KEY,
+            motivo TEXT,
             criado_em TEXT
         )
     """)
@@ -367,6 +376,30 @@ def analisar_ativo(symbol, candles):
     ordem = {"FORTE": 3, "MÉDIO": 2, "ALERTA": 1}
     forca_max = max(sinais, key=lambda s: ordem.get(s["forca"], 0))["forca"]
 
+    # Score de qualidade 0-100
+    score = 0
+    # Volume (até 40 pts)
+    if vol_rel >= 10:   score += 40
+    elif vol_rel >= 5:  score += 25
+    elif vol_rel >= 2:  score += 10
+
+    # RSI extremo (até 20 pts)
+    if rsi < 25 or rsi > 75:  score += 20
+    elif rsi < 35 or rsi > 65: score += 10
+
+    # Alinhamento com tendência EMA (até 20 pts)
+    if len(ema9) >= 2 and len(ema21) >= 2:
+        bull_trend = ema9[-1] > ema21[-1] and closes[-1] > ema9[-1]
+        bear_trend = ema9[-1] < ema21[-1] and closes[-1] < ema9[-1]
+        long_sinal = any("LONG" in s["tipo"] for s in sinais)
+        short_sinal = any("SHORT" in s["tipo"] for s in sinais)
+        if (long_sinal and bull_trend) or (short_sinal and bear_trend):
+            score += 20
+
+    # Força do sinal (até 20 pts)
+    if forca_max == "FORTE":  score += 20
+    elif forca_max == "MÉDIO": score += 10
+
     return {
         "symbol": symbol.upper(),
         "preco": preco,
@@ -376,7 +409,8 @@ def analisar_ativo(symbol, candles):
         "suporte": round(suporte, 4),
         "resistencia": round(resist, 4),
         "sinais": sinais,
-        "forca_max": forca_max
+        "forca_max": forca_max,
+        "score": min(score, 100)
     }
 
 # ─────────────────────────────────────────────
@@ -404,6 +438,227 @@ def formatar_sinal(r):
 # ─────────────────────────────────────────────
 # SCANNER PRINCIPAL
 # ─────────────────────────────────────────────
+def get_blacklist():
+    """Retorna set de ativos na blacklist."""
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("SELECT ativo FROM blacklist")
+    rows = c.fetchall()
+    conn.close()
+    return {r[0].upper() for r in rows}
+
+def adicionar_blacklist(ativo, motivo=""):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    agora = brt_agora().strftime("%Y-%m-%d %H:%M")
+    c.execute("INSERT OR REPLACE INTO blacklist VALUES (?,?,?)",
+              (ativo.upper(), motivo, agora))
+    conn.commit()
+    conn.close()
+
+def remover_blacklist(ativo):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM blacklist WHERE ativo=?", (ativo.upper(),))
+    conn.commit()
+    conn.close()
+
+def normalizar_symbol_coinalyze(symbol):
+    """
+    Converte qualquer formato de símbolo para o formato agregado do Coinalyze.
+    BTCUSDT / BTC-USDT / BTC_USDT / BTC → BTCUSDT_PERP.A
+    Sufixo .A = agregado de TODOS os perpetuais (Binance + Bybit + OKX + Gate + Bitget + 20+ exchanges)
+    Máxima visão de mercado possível.
+    """
+    s = symbol.upper().strip()
+    # Remover sufixos de exchange já existentes
+    for suf in ["_PERP.A", "_PERP.0", "_PERP.6", ".P", "-PERP"]:
+        s = s.replace(suf, "")
+    # Normalizar separadores
+    s = s.replace("-", "").replace("_", "").replace("/", "")
+    # Garantir que termina em USDT
+    if not s.endswith("USDT") and not s.endswith("USDC"):
+        s = s + "USDT"
+    # Aplicar sufixo agregado
+    return f"{s}_PERP.A"
+
+def buscar_sentimento(symbol):
+    """
+    Busca dados de sentimento agregados do Coinalyze (API gratuita).
+    Usa sufixo _PERP.A = agregado multi-exchange (Binance+Bybit+OKX+Gate+Bitget+20+).
+    Endpoints usados em paralelo:
+      - /funding-rate       → Funding Rate atual (OI-weighted agregado)
+      - /open-interest      → OI total em USD (convert_to_usd=true)
+      - /long-short-ratio-history → L/S Ratio última hora
+      - /liquidation-history      → Liquidações últimas 24h (long + short)
+    """
+    sym_cg  = normalizar_symbol_coinalyze(symbol)
+    headers = {"api_key": COINALYZE_KEY}
+    ts_now  = int(time.time())
+    ts_1h   = ts_now - 3600
+    ts_24h  = ts_now - 86400
+    resultado = {"symbol_cg": sym_cg}
+
+    # 1. Funding Rate atual (OI-weighted = mais representativo do mercado)
+    try:
+        r = requests.get(
+            f"{COINALYZE_BASE}/funding-rate",
+            params={"symbols": sym_cg},
+            headers=headers, timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                resultado["funding"] = round(float(data[0].get("value", 0)) * 100, 4)
+    except Exception as e:
+        log.debug(f"Funding {sym_cg}: {e}")
+
+    # 2. Funding Rate previsto (próximo ciclo)
+    try:
+        r = requests.get(
+            f"{COINALYZE_BASE}/predicted-funding-rate",
+            params={"symbols": sym_cg},
+            headers=headers, timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                resultado["funding_pred"] = round(float(data[0].get("value", 0)) * 100, 4)
+    except Exception as e:
+        log.debug(f"Funding previsto {sym_cg}: {e}")
+
+    # 3. Open Interest em USD (agregado de todas as exchanges)
+    try:
+        r = requests.get(
+            f"{COINALYZE_BASE}/open-interest",
+            params={"symbols": sym_cg, "convert_to_usd": "true"},
+            headers=headers, timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                resultado["oi_usd"] = float(data[0].get("value", 0))
+    except Exception as e:
+        log.debug(f"OI {sym_cg}: {e}")
+
+    # 4. Long/Short Ratio — última hora (history para pegar tendência)
+    try:
+        r = requests.get(
+            f"{COINALYZE_BASE}/long-short-ratio-history",
+            params={
+                "symbols":  sym_cg,
+                "interval": "1hour",
+                "from":     ts_1h,
+                "to":       ts_now
+            },
+            headers=headers, timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data and data[0].get("history"):
+                hist = data[0]["history"]
+                ultimo = hist[-1]
+                # r=ratio, l=long%, s=short%
+                resultado["ls_ratio"] = round(float(ultimo.get("r", 1)), 3)
+                resultado["ls_long_pct"]  = round(float(ultimo.get("l", 50)), 1)
+                resultado["ls_short_pct"] = round(float(ultimo.get("s", 50)), 1)
+    except Exception as e:
+        log.debug(f"L/S {sym_cg}: {e}")
+
+    # 5. Liquidações últimas 24h (long + short separados)
+    try:
+        r = requests.get(
+            f"{COINALYZE_BASE}/liquidation-history",
+            params={
+                "symbols":        sym_cg,
+                "interval":       "1hour",
+                "from":           ts_24h,
+                "to":             ts_now,
+                "convert_to_usd": "true"
+            },
+            headers=headers, timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data and data[0].get("history"):
+                hist = data[0]["history"]
+                # l=long liquidations, s=short liquidations
+                liq_long  = sum(float(h.get("l", 0)) for h in hist)
+                liq_short = sum(float(h.get("s", 0)) for h in hist)
+                resultado["liq_long_usd"]  = liq_long
+                resultado["liq_short_usd"] = liq_short
+    except Exception as e:
+        log.debug(f"Liq {sym_cg}: {e}")
+
+    return resultado if len(resultado) > 1 else None
+
+def fmt_usd(val):
+    """Formata valor em USD de forma compacta."""
+    if val >= 1_000_000_000:
+        return f"${val/1_000_000_000:.2f}B"
+    elif val >= 1_000_000:
+        return f"${val/1_000_000:.1f}M"
+    elif val >= 1_000:
+        return f"${val/1_000:.0f}K"
+    return f"${val:,.0f}"
+
+def formatar_sentimento(sent):
+    """
+    Formata dados de sentimento agregados (multi-exchange via Coinalyze _PERP.A).
+    """
+    if not sent or len(sent) <= 1:
+        return ""
+
+    sym   = sent.get("symbol_cg", "")
+    linhas = [f"📡 <b>SENTIMENTO AGREGADO</b> — {sym}"]
+
+    if "funding" in sent:
+        fr = sent["funding"]
+        if fr < -0.005:
+            emoji, desc = "🟢🟢", "muito negativo → forte pressão LONG"
+        elif fr < 0:
+            emoji, desc = "🟢", "negativo → pressão LONG"
+        elif fr < 0.01:
+            emoji, desc = "⚪", "neutro"
+        elif fr < 0.03:
+            emoji, desc = "🔴", "positivo → pressão SHORT"
+        else:
+            emoji, desc = "🔴🔴", "muito positivo → forte pressão SHORT"
+        linhas.append(f"  Funding atual: {emoji} {fr:+.4f}% ({desc})")
+
+    if "funding_pred" in sent:
+        fp = sent["funding_pred"]
+        linhas.append(f"  Funding previsto: {fp:+.4f}%")
+
+    if "oi_usd" in sent:
+        linhas.append(f"  OI agregado: {fmt_usd(sent['oi_usd'])}")
+
+    if "ls_ratio" in sent:
+        ls = sent["ls_ratio"]
+        lp = sent.get("ls_long_pct", 0)
+        sp = sent.get("ls_short_pct", 0)
+        if ls > 1.5:
+            emoji, desc = "🟢🟢", "longs dominam fortemente"
+        elif ls > 1.1:
+            emoji, desc = "🟢", "longs dominam"
+        elif ls < 0.67:
+            emoji, desc = "🔴🔴", "shorts dominam fortemente"
+        elif ls < 0.9:
+            emoji, desc = "🔴", "shorts dominam"
+        else:
+            emoji, desc = "⚪", "equilibrado"
+        linhas.append(f"  L/S Ratio: {emoji} {ls} ({lp:.1f}%L / {sp:.1f}%S — {desc})")
+
+    if "liq_long_usd" in sent and "liq_short_usd" in sent:
+        ll    = sent["liq_long_usd"]
+        ls_liq = sent["liq_short_usd"]
+        total  = ll + ls_liq
+        if total > 0:
+            dom = "longs liq." if ll > ls_liq else "shorts liq."
+            linhas.append(f"  Liq 24h: {fmt_usd(total)} ({dom} | L:{fmt_usd(ll)} S:{fmt_usd(ls_liq)})")
+
+    return "\n".join(linhas)
+
 def rodar_scanner_debug():
     """Roda em 5 ativos e reporta exatamente o que encontra para diagnóstico."""
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
@@ -470,7 +725,12 @@ def rodar_scanner():
     prioridade_max = []  # vol > 10x
     alta_prioridade = [] # vol 5-10x
 
+    blacklist = get_blacklist()
+
     for symbol in pares:
+        # Ignorar ativos na blacklist
+        if symbol.upper() in blacklist:
+            continue
         try:
             candles = buscar_candles(symbol)
             if not candles:
@@ -565,23 +825,35 @@ def rodar_scanner():
         linhas.append(f"🚨 <b>PRIORIDADE MÁXIMA — Vol &gt;10x</b>")
         linhas.append("")
         for i, r in enumerate(prioridade_max, 1):
+            sent = buscar_sentimento(r["symbol"])
+            sent_txt = formatar_sentimento(sent)
+            score_bar = "█" * (r.get("score",0)//10) + "░" * (10 - r.get("score",0)//10)
             linhas.append(
                 f"{i}. <b>{r['symbol']}</b> {r['vies_emoji']} {r['vies']}"
                 f" | Vol <b>{r['vol_rel']}x</b> | RSI {r['rsi']}"
                 f" | 💲{r['preco']:.6g}"
             )
-        linhas.append("")
+            linhas.append(f"   Score: {r.get('score',0)}/100 [{score_bar}]")
+            if sent_txt:
+                linhas.append(sent_txt)
+            linhas.append("")
 
     if alta_prioridade:
         linhas.append(f"⚡ <b>ALTA PRIORIDADE — Vol 5–10x</b>")
         linhas.append("")
         for i, r in enumerate(alta_prioridade, 1):
+            sent = buscar_sentimento(r["symbol"])
+            sent_txt = formatar_sentimento(sent)
+            score_bar = "█" * (r.get("score",0)//10) + "░" * (10 - r.get("score",0)//10)
             linhas.append(
                 f"{i}. <b>{r['symbol']}</b> {r['vies_emoji']} {r['vies']}"
                 f" | Vol <b>{r['vol_rel']}x</b> | RSI {r['rsi']}"
                 f" | 💲{r['preco']:.6g}"
             )
-        linhas.append("")
+            linhas.append(f"   Score: {r.get('score',0)}/100 [{score_bar}]")
+            if sent_txt:
+                linhas.append(sent_txt)
+            linhas.append("")
 
     linhas += [
         f"━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -666,6 +938,23 @@ def buscar_preco_atual(ativo):
 # Controle de alertas já enviados (evita duplicatas no mesmo ciclo)
 _alertas_enviados = {}
 
+def calcular_duracao(criado_em):
+    """Calcula duração do trade desde a abertura."""
+    try:
+        from datetime import datetime
+        fmt = "%Y-%m-%d %H:%M"
+        abertura = datetime.strptime(criado_em, fmt)
+        agora    = brt_agora().replace(tzinfo=None)
+        delta    = agora - abertura
+        horas    = int(delta.total_seconds() // 3600)
+        minutos  = int((delta.total_seconds() % 3600) // 60)
+        if horas >= 24:
+            dias = horas // 24
+            return f"{dias}d {horas % 24}h {minutos}m"
+        return f"{horas}h {minutos}m"
+    except:
+        return "—"
+
 def monitorar_trades():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -704,15 +993,23 @@ def monitorar_trades():
             # A3 atingido (verificar do maior para o menor)
             elif high >= a3 and f"{chave_base}_a3" not in _alertas_enviados:
                 _alertas_enviados[f"{chave_base}_a3"] = True
+                atualizar_resultado(ativo, "WIN_A3")
+                duracao = calcular_duracao(criado)
                 enviar_telegram(
                     f"🏆 <b>A3 ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
                     f"✅ Realizar 80% da posição\n"
-                    f"🎉 Trailing Stop ativo no restante!"
+                    f"🎉 Trailing Stop ativo no restante!\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📋 <b>RESUMO DO TRADE</b>\n"
+                    f"Entrada: ${entrada} → A1: ${a1} → A2: ${a2} → A3: ${a3}\n"
+                    f"Resultado: ✅ WIN A3 (RR 3:1)\n"
+                    f"Duração: {duracao}"
                 )
             # A2 atingido
             elif high >= a2 and f"{chave_base}_a2" not in _alertas_enviados:
                 _alertas_enviados[f"{chave_base}_a2"] = True
+                atualizar_resultado(ativo, "WIN_A2")
                 enviar_telegram(
                     f"🎯 <b>A2 ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
@@ -722,20 +1019,29 @@ def monitorar_trades():
             # A1 atingido
             elif high >= a1 and f"{chave_base}_a1" not in _alertas_enviados:
                 _alertas_enviados[f"{chave_base}_a1"] = True
+                atualizar_resultado(ativo, "WIN_A1")
                 enviar_telegram(
                     f"🎯 <b>A1 ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
                     f"✅ Realizar 25% da posição\n"
                     f"🔒 Mover Stop para entrada ${entrada} (breakeven)\n"
+                    f"⏰ Lembrete em 5 min: confirme o breakeven!\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
             # Stop atingido
             elif low <= stop and f"{chave_base}_stop" not in _alertas_enviados:
                 _alertas_enviados[f"{chave_base}_stop"] = True
+                atualizar_resultado(ativo, "LOSS")
+                duracao = calcular_duracao(criado)
                 enviar_telegram(
-                    f"🛑 <b>STOP ATINGIDO — {ativo} LONG #{tid}</b>\n"
+                    f"🛑 <b>STOP — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
-                    f"❌ Sair da posição imediatamente!"
+                    f"❌ Sair imediatamente!\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📋 <b>RESUMO DO TRADE</b>\n"
+                    f"Entrada: ${entrada} | Saída: ${preco:.6g}\n"
+                    f"Resultado: ❌ LOSS\n"
+                    f"Duração: {duracao}"
                 )
 
         elif direcao == "SHORT":
@@ -752,15 +1058,23 @@ def monitorar_trades():
             # A3 atingido (verificar do maior para o menor)
             elif low <= a3 and f"{chave_base}_a3" not in _alertas_enviados:
                 _alertas_enviados[f"{chave_base}_a3"] = True
+                atualizar_resultado(ativo, "WIN_A3")
+                duracao = calcular_duracao(criado)
                 enviar_telegram(
                     f"🏆 <b>A3 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
                     f"✅ Realizar 80% da posição\n"
-                    f"🎉 Trailing Stop ativo no restante!"
+                    f"🎉 Trailing Stop ativo no restante!\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📋 <b>RESUMO DO TRADE</b>\n"
+                    f"Entrada: ${entrada} → A1: ${a1} → A2: ${a2} → A3: ${a3}\n"
+                    f"Resultado: ✅ WIN A3 (RR 3:1)\n"
+                    f"Duração: {duracao}"
                 )
             # A2 atingido
             elif low <= a2 and f"{chave_base}_a2" not in _alertas_enviados:
                 _alertas_enviados[f"{chave_base}_a2"] = True
+                atualizar_resultado(ativo, "WIN_A2")
                 enviar_telegram(
                     f"🎯 <b>A2 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
@@ -770,20 +1084,29 @@ def monitorar_trades():
             # A1 atingido
             elif low <= a1 and f"{chave_base}_a1" not in _alertas_enviados:
                 _alertas_enviados[f"{chave_base}_a1"] = True
+                atualizar_resultado(ativo, "WIN_A1")
                 enviar_telegram(
                     f"🎯 <b>A1 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
                     f"✅ Realizar 25% da posição\n"
                     f"🔒 Mover Stop para entrada ${entrada} (breakeven)\n"
+                    f"⏰ Lembrete em 5 min: confirme o breakeven!\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
             # Stop atingido
             elif high >= stop and f"{chave_base}_stop" not in _alertas_enviados:
                 _alertas_enviados[f"{chave_base}_stop"] = True
+                atualizar_resultado(ativo, "LOSS")
+                duracao = calcular_duracao(criado)
                 enviar_telegram(
-                    f"🛑 <b>STOP ATINGIDO — {ativo} SHORT #{tid}</b>\n"
+                    f"🛑 <b>STOP — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
-                    f"❌ Sair da posição imediatamente!"
+                    f"❌ Sair imediatamente!\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📋 <b>RESUMO DO TRADE</b>\n"
+                    f"Entrada: ${entrada} | Saída: ${preco:.6g}\n"
+                    f"Resultado: ❌ LOSS\n"
+                    f"Duração: {duracao}"
                 )
 
 # ─────────────────────────────────────────────
@@ -795,14 +1118,22 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v10 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v11 — Comandos</b>\n\n"
+            "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
-            "/resultado ATIVO WIN_A1 | LOSS\n"
+            "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
             "/trades — trades abertos\n"
-            "/relatorio — estatísticas\n"
+            "/relatorio — estatísticas e P&L\n\n"
+            "<b>🔍 SCANNER</b>\n"
             "/scan — rodar scanner agora\n"
-            "/ativos — total de ativos monitorados\n"
+            "/ativos — total de ativos monitorados\n\n"
+            "<b>🚫 BLACKLIST</b>\n"
+            "/bloquear ATIVO [motivo] — ignorar no scanner\n"
+            "/desbloquear ATIVO — remover da blacklist\n"
+            "/blacklist — ver ativos bloqueados\n\n"
+            "<b>⚙️ SISTEMA</b>\n"
             "/status — status do bot\n"
+            "/debug — diagnóstico da API\n"
             "/ajuda — este menu"
         )
 
@@ -854,6 +1185,27 @@ def processar_comando(texto):
 
     elif cmd == "/scan":
         return "SCAN_SOLICITADO"
+
+    elif cmd == "/bloquear":
+        if len(partes) < 2:
+            return "❌ Formato: /bloquear ATIVO [motivo]"
+        ativo  = partes[1].upper()
+        motivo = " ".join(partes[2:]) if len(partes) > 2 else "Manual"
+        adicionar_blacklist(ativo, motivo)
+        return f"🚫 {ativo} adicionado à blacklist\nMotivo: {motivo}"
+
+    elif cmd == "/desbloquear":
+        if len(partes) < 2:
+            return "❌ Formato: /desbloquear ATIVO"
+        ativo = partes[1].upper()
+        remover_blacklist(ativo)
+        return f"✅ {ativo} removido da blacklist"
+
+    elif cmd == "/blacklist":
+        bl = get_blacklist()
+        if not bl:
+            return "📋 Blacklist vazia"
+        return "🚫 <b>Blacklist</b>\n" + "\n".join(f"  • {a}" for a in sorted(bl))
 
     elif cmd == "/debug":
         return "DEBUG_SOLICITADO"
@@ -938,7 +1290,7 @@ def main():
     init_db()
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     enviar_telegram(
-        f"🚀 <b>LucSharkTrade v10 ONLINE!</b>\n"
+        f"🚀 <b>LucSharkTrade v11 ONLINE!</b>\n"
         f"📅 {brt}\n\n"
         f"✅ Scanner 15M ativo\n"
         f"✅ 3 níveis: FORTE ({MULT_FORTE}x) | MÉDIO ({MULT_MEDIO}x) | ALERTA ({MULT_ALERTA}x)\n"
