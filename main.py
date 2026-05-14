@@ -1219,7 +1219,7 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.2 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.3 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1374,11 +1374,11 @@ def processar_comando(texto):
         brt       = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
         ex_online = sum(1 for ex in EXCHANGES_CONFIG if ex["instance"])
         return (
-            f"✅ <b>LucSharkTrade v12.2 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.3 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
-            f"🔧 Fix: atualizar_resultado sem ORDER BY no UPDATE\n"
+            f"🔧 v12.3: comandos Telegram em thread dedicada\n"
             f"🔧 Tolerância entrada: 0.5%"
         )
 
@@ -1387,6 +1387,110 @@ def processar_comando(texto):
 def iniciar_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+# =========================================================================
+# v12.3 — FIX: Comandos Telegram não respondiam
+#   1. RELAXADO filtro de idade (60s -> 600s) — era a causa raiz dos descartes
+#   2. SEPARADO loop de comandos (rápido) do loop de monitoramento (lento)
+#   3. monitorar_trades() agora roda em thread dedicada
+#   4. STARTUP preserva comandos recentes (<120s) em vez de descartar todos
+#   5. Scanner manual roda em thread para não bloquear próximos comandos
+# =========================================================================
+
+# Estado compartilhado entre threads
+_estado = {
+    "ultimo_offset":         None,
+    "ultimo_monitor":        0,
+    "ultimo_relatorio_dia":  None,
+    "ultimo_relatorio_sem":  None,
+}
+_estado_lock = threading.Lock()
+
+def loop_monitor_trades():
+    """Thread dedicada para monitorar trades abertos. Não bloqueia o Telegram."""
+    log.info("Thread de monitoramento iniciada.")
+    while True:
+        try:
+            monitorar_trades()
+            with _estado_lock:
+                _estado["ultimo_monitor"] = time.time()
+        except Exception as e:
+            log.error(f"monitorar_trades erro: {e}")
+
+        # Relatórios automáticos (deduplicados via chave de janela)
+        try:
+            agora_brt = brt_agora()
+            chave_dia = agora_brt.strftime("%Y-%m-%d")
+            chave_sem = agora_brt.strftime("%Y-W%W")
+            if agora_brt.hour == 18 and agora_brt.minute == 0:
+                with _estado_lock:
+                    ja_rodou = _estado["ultimo_relatorio_dia"] == chave_dia
+                if not ja_rodou:
+                    relatorio_diario()
+                    with _estado_lock:
+                        _estado["ultimo_relatorio_dia"] = chave_dia
+            if agora_brt.weekday() == 0 and agora_brt.hour == 9 and agora_brt.minute == 0:
+                with _estado_lock:
+                    ja_rodou = _estado["ultimo_relatorio_sem"] == chave_sem
+                if not ja_rodou:
+                    relatorio_semanal()
+                    with _estado_lock:
+                        _estado["ultimo_relatorio_sem"] = chave_sem
+        except Exception as e:
+            log.error(f"relatorios automaticos erro: {e}")
+
+        time.sleep(INTERVALO_SEG)
+
+def loop_comandos_telegram():
+    """Thread principal — processa comandos do Telegram com baixa latência."""
+    log.info("Thread de comandos Telegram iniciada.")
+    while True:
+        try:
+            with _estado_lock:
+                offset_atual = _estado["ultimo_offset"]
+            updates = get_updates(offset_atual)
+        except Exception as e:
+            log.error(f"get_updates erro: {e}")
+            time.sleep(3)
+            continue
+
+        for upd in updates:
+            update_id = upd.get("update_id")
+            if update_id is None:
+                continue
+            with _estado_lock:
+                _estado["ultimo_offset"] = update_id + 1
+
+            msg   = upd.get("message", {})
+            texto = msg.get("text", "")
+            if not texto or not texto.startswith("/"):
+                continue
+
+            # FIX v12.3: filtro relaxado — só descarta msgs MUITO antigas (>10min).
+            # Antes era 60s, o que descartava comandos legítimos porque o loop
+            # ficava bloqueado em monitorar_trades() + sleep(30s) na mesma thread.
+            msg_date = msg.get("date", 0)
+            if msg_date and (time.time() - msg_date) > 600:
+                log.warning(f"Comando MUITO antigo ignorado (>10min): {texto}")
+                continue
+
+            log.info(f"Comando recebido: {texto}")
+            try:
+                resposta = processar_comando(texto)
+                if resposta == "SCAN_SOLICITADO":
+                    enviar_telegram("🔍 Scanner iniciado manualmente...")
+                    # roda em thread para não bloquear próximos comandos
+                    threading.Thread(target=rodar_scanner, daemon=True).start()
+                elif resposta == "DEBUG_SOLICITADO":
+                    threading.Thread(target=rodar_scanner_debug, daemon=True).start()
+                elif resposta:
+                    enviar_telegram(resposta)
+            except Exception as e:
+                log.error(f"Erro processando '{texto}': {e}")
+                try:
+                    enviar_telegram(f"⚠️ Erro ao processar {texto}: {e}")
+                except:
+                    pass
 
 def main():
     init_db()
@@ -1398,6 +1502,7 @@ def main():
 
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
 
+    # Detecta restart recente (evita spam de mensagem ONLINE em deploys curtos)
     try:
         conn_s = sqlite3.connect("trades.db")
         cs     = conn_s.cursor()
@@ -1418,15 +1523,17 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.2 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.3 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
-            f"✅ Fix: sqlite ORDER BY no UPDATE corrigido\n"
+            f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
+            f"✅ FIX: monitoramento em thread dedicada\n"
+            f"✅ FIX: filtro de idade de mensagem (60s→600s)\n"
             f"✅ Monitoramento HIGH/LOW intracandle\n"
-            f"✅ Tolerância entrada: 0.5%\n"
             f"✅ Stop com prioridade máxima\n\n"
             f"Envie /ajuda para ver os comandos."
         )
 
+    # FIX v12.3: preserva comandos recentes (<120s) em vez de descartar tudo
     ultimo_offset = None
     try:
         r = requests.get(
@@ -1435,61 +1542,37 @@ def main():
         ).json()
         pending = r.get("result", [])
         if pending:
-            ultimo_offset = pending[-1]["update_id"] + 1
-            requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params={"offset": ultimo_offset, "limit": 1, "timeout": 0}, timeout=10
-            )
-            log.info(f"Descartadas {len(pending)} mensagens pendentes.")
+            agora_ts = time.time()
+            primeiro_recente = None
+            for upd in pending:
+                m = upd.get("message", {})
+                if (agora_ts - m.get("date", 0)) <= 120 and m.get("text", "").startswith("/"):
+                    primeiro_recente = upd["update_id"]
+                    break
+            if primeiro_recente is not None:
+                ultimo_offset = primeiro_recente
+                n_recentes = len([u for u in pending if u["update_id"] >= primeiro_recente])
+                log.info(f"Mantendo {n_recentes} comandos recentes para processar.")
+            else:
+                ultimo_offset = pending[-1]["update_id"] + 1
+                requests.get(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                    params={"offset": ultimo_offset, "limit": 1, "timeout": 0}, timeout=10
+                )
+                log.info(f"Descartadas {len(pending)} mensagens antigas (>120s).")
     except Exception as e:
-        log.warning(f"Erro ao descartar pendentes: {e}")
+        log.warning(f"Erro ao processar pendentes: {e}")
         ultimo_offset = None
 
-    while True:
-        try:
-            updates = get_updates(ultimo_offset)
-        except Exception as e:
-            log.error(f"get_updates erro: {e}")
-            time.sleep(5)
-            continue
+    with _estado_lock:
+        _estado["ultimo_offset"] = ultimo_offset
 
-        for upd in updates:
-            update_id = upd.get("update_id")
-            if update_id is None:
-                continue
-            ultimo_offset = update_id + 1
-            msg   = upd.get("message", {})
-            texto = msg.get("text", "")
-            if not texto or not texto.startswith("/"):
-                continue
-            msg_date = msg.get("date", 0)
-            if msg_date and (time.time() - msg_date) > 60:
-                log.debug(f"Mensagem antiga ignorada: {texto}")
-                continue
-            log.info(f"Comando recebido: {texto}")
-            try:
-                resposta = processar_comando(texto)
-                if resposta == "SCAN_SOLICITADO":
-                    enviar_telegram("🔍 Scanner iniciado manualmente...")
-                    rodar_scanner()
-                elif resposta == "DEBUG_SOLICITADO":
-                    rodar_scanner_debug()
-                elif resposta:
-                    enviar_telegram(resposta)
-            except Exception as e:
-                log.error(f"Erro processando {texto}: {e}")
+    # FIX v12.3: monitoramento em thread separada — não bloqueia comandos
+    monitor_thread = threading.Thread(target=loop_monitor_trades, daemon=True)
+    monitor_thread.start()
 
-        monitorar_trades()
-
-        agora_brt = brt_agora()
-        if agora_brt.hour == 18 and agora_brt.minute == 0:
-            relatorio_diario()
-            time.sleep(60)
-        if agora_brt.weekday() == 0 and agora_brt.hour == 9 and agora_brt.minute == 0:
-            relatorio_semanal()
-            time.sleep(60)
-
-        time.sleep(INTERVALO_SEG)
+    # Loop principal = APENAS Telegram (máxima responsividade)
+    loop_comandos_telegram()
 
 if __name__ == "__main__":
     main()
