@@ -8,12 +8,8 @@ import json
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify
 
-# Flask app para expor dados ao dashboard
 flask_app = Flask(__name__)
 
-# ─────────────────────────────────────────────
-# CONFIGURAÇÃO
-# ─────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CAPITAL_INICIAL  = float(os.environ.get("CAPITAL_INICIAL", "1000"))
@@ -24,7 +20,6 @@ MIN_VOLUME_24H   = float(os.environ.get("MIN_VOLUME_24H", "100000"))
 COINALYZE_KEY    = os.environ.get("COINALYZE_KEY", "376762b9-d136-4457-a192-9cd0a7865d43")
 COINALYZE_BASE   = "https://api.coinalyze.net/v1"
 
-# ── Parâmetros do scanner ──
 TIMEFRAME_SCAN     = "minute15"
 CANDLES_ANALISE    = 50
 MULT_FORTE         = 1.8
@@ -38,9 +33,6 @@ OFFSET_BRT         = -3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-# BANCO DE DADOS
-# ─────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -91,15 +83,21 @@ def salvar_trade(ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent):
     conn.close()
     return tid
 
+# ── FIX CRÍTICO: atualizar_resultado sem ORDER BY no UPDATE (inválido no SQLite) ──
 def atualizar_resultado(ativo, resultado):
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
+    # Busca o id do último trade aberto para esse ativo
     c.execute("""
-        UPDATE trades SET resultado=?
+        SELECT id FROM trades
         WHERE ativo=? AND resultado='ABERTO'
         ORDER BY id DESC LIMIT 1
-    """, (resultado, ativo.upper()))
-    conn.commit()
+    """, (ativo.upper(),))
+    row = c.fetchone()
+    if row:
+        trade_id = row[0]
+        c.execute("UPDATE trades SET resultado=? WHERE id=?", (resultado, trade_id))
+        conn.commit()
     conn.close()
 
 def listar_trades():
@@ -123,9 +121,6 @@ def relatorio():
     wr = (wins / (wins + loss) * 100) if (wins + loss) > 0 else 0
     return total, wins, loss, abertos, wr
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
 def brt_agora():
     return datetime.now(timezone(timedelta(hours=OFFSET_BRT)))
 
@@ -157,9 +152,6 @@ def get_updates(offset=None):
     except:
         return []
 
-# ─────────────────────────────────────────────
-# EXCHANGES
-# ─────────────────────────────────────────────
 LBANK_BASE = "https://api.lbank.info"
 
 EXCHANGES_CONFIG = [
@@ -168,22 +160,20 @@ EXCHANGES_CONFIG = [
     {"id": "bybit",   "label": "Bybit",   "instance": None},
 ]
 
-# ── FIX 4: init_exchanges com timeout para não crashar no Railway ──
 def init_exchanges():
-    """Inicializa ccxt com timeout — evita crash no startup do Railway."""
     import ccxt as _ccxt_local
     for ex in EXCHANGES_CONFIG:
         try:
             instance = getattr(_ccxt_local, ex["id"])({
                 "enableRateLimit": True,
-                "timeout": 10000,  # FIX: timeout 10s evita hang no Railway
+                "timeout": 10000,
             })
             instance.load_markets()
             ex["instance"] = instance
             log.info(f"Exchange {ex['label']}: OK ({len(instance.markets)} mercados)")
         except Exception as e:
             log.warning(f"Exchange {ex['label']}: falhou — {e}")
-            ex["instance"] = None  # FIX: garantir None explícito em falha
+            ex["instance"] = None
 
 def buscar_todos_pares():
     todos = []
@@ -445,9 +435,6 @@ def analisar_ativo(symbol, candles):
         "exchange":    exchange_label,
     }
 
-# ─────────────────────────────────────────────
-# SENTIMENTO
-# ─────────────────────────────────────────────
 def normalizar_symbol_coinalyze(symbol):
     s = symbol.upper().strip()
     for suf in ["_PERP.A", "_PERP.0", "_PERP.6", ".P", "-PERP"]:
@@ -566,9 +553,6 @@ def formatar_sentimento(sent):
             linhas.append(f"  Liq 24h: {fmt_usd(total)} ({dom} | L:{fmt_usd(ll)} S:{fmt_usd(ls_liq)})")
     return "\n".join(linhas)
 
-# ─────────────────────────────────────────────
-# SCANNER
-# ─────────────────────────────────────────────
 def get_blacklist():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -723,9 +707,6 @@ def rodar_scanner_debug():
             msg.append(f"  {symbol}: EXCECAO {e}")
     enviar_telegram("\n".join(msg))
 
-# ─────────────────────────────────────────────
-# PREÇO ATUAL
-# ─────────────────────────────────────────────
 def normalizar_symbol_ccxt(ativo):
     s = ativo.upper().strip()
     if "/" in s: return s
@@ -737,13 +718,7 @@ def normalizar_symbol_ccxt(ativo):
     return s
 
 def buscar_preco_atual(ativo):
-    """
-    Busca preço atual com high/low do candle recente.
-    FIX: retorna high e low reais do último candle — essencial para
-    detectar acionamentos intracandle.
-    """
     symbol = normalizar_symbol_ccxt(ativo)
-    # 1. Tentar fetch_ticker (mais rápido)
     if CCXT_AVAILABLE:
         try:
             ticker = _exchange.fetch_ticker(symbol)
@@ -756,7 +731,6 @@ def buscar_preco_atual(ativo):
             }
         except Exception as e:
             log.debug(f"Ticker {symbol}: {e}")
-    # 2. Tentar via exchanges configuradas
     for ex in EXCHANGES_CONFIG:
         if ex["instance"]:
             try:
@@ -770,7 +744,6 @@ def buscar_preco_atual(ativo):
                 }
             except:
                 continue
-    # 3. Fallback: candles (high/low do candle recente)
     sym_lbank = symbol.lower().replace("/", "_")
     candles   = buscar_candles(sym_lbank, "minute5", 3)
     if candles:
@@ -787,9 +760,6 @@ def buscar_preco_atual(ativo):
             }
     return None
 
-# ─────────────────────────────────────────────
-# CONTROLE DE ALERTAS
-# ─────────────────────────────────────────────
 _alertas_enviados = {}
 
 def alerta_ja_enviado(chave):
@@ -834,18 +804,7 @@ def calcular_duracao(criado_em):
     except:
         return "—"
 
-# ─────────────────────────────────────────────
-# MONITORAR TRADES — VERSÃO CORRIGIDA v2
-# ─────────────────────────────────────────────
 def monitorar_trades():
-    """
-    FIX v2 — Bugs corrigidos:
-    1. Checks independentes (não elif encadeado) para stop/alvos/entrada
-    2. Stop verifica ANTES dos alvos e usa `continue`
-    3. Entrada usa low <= entrada <= high (intracandle) + tol 0.5%
-    4. Zona de aproximação só dispara se entrada ainda não acionada
-    5. Alvos superiores marcam alvos inferiores como enviados (sem spam)
-    """
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
     c.execute("SELECT * FROM trades WHERE resultado='ABERTO'")
@@ -865,14 +824,9 @@ def monitorar_trades():
         low   = dados.get("low", preco)
 
         base        = f"{tid}_{ativo}"
-        tol_entrada = entrada * 0.005  # FIX: 0.5% (era 0.3% — muito restrito)
+        tol_entrada = entrada * 0.005
 
-        # ══════════════════════════════════════
-        # LONG
-        # ══════════════════════════════════════
         if direcao == "LONG":
-
-            # ── STOP — verificar PRIMEIRO com continue ──
             if low <= stop and not alerta_ja_enviado(f"{base}_stop"):
                 marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
@@ -885,12 +839,10 @@ def monitorar_trades():
                     f"📋 Entrada: ${entrada} | Saída: ${preco:.6g}\n"
                     f"❌ LOSS | ⏱ {duracao}"
                 )
-                continue  # FIX: não verificar alvos após stop
-
-            # ── A3 ──
+                continue
             if high >= a3 and not alerta_ja_enviado(f"{base}_a3"):
                 marcar_alerta(f"{base}_a3")
-                marcar_alerta(f"{base}_a2")  # FIX: marcar inferiores (sem spam)
+                marcar_alerta(f"{base}_a2")
                 marcar_alerta(f"{base}_a1")
                 marcar_alerta(f"{base}_entrada")
                 atualizar_resultado(ativo, "WIN_A3")
@@ -903,11 +855,9 @@ def monitorar_trades():
                     f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
                     f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
                 )
-
-            # ── A2 ──
             elif high >= a2 and not alerta_ja_enviado(f"{base}_a2"):
                 marcar_alerta(f"{base}_a2")
-                marcar_alerta(f"{base}_a1")  # FIX: marcar inferior
+                marcar_alerta(f"{base}_a1")
                 marcar_alerta(f"{base}_entrada")
                 atualizar_resultado(ativo, "WIN_A2")
                 enviar_telegram(
@@ -915,8 +865,6 @@ def monitorar_trades():
                     f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
                     f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
                 )
-
-            # ── A1 ──
             elif high >= a1 and not alerta_ja_enviado(f"{base}_a1"):
                 marcar_alerta(f"{base}_a1")
                 marcar_alerta(f"{base}_entrada")
@@ -928,9 +876,6 @@ def monitorar_trades():
                     f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
-
-            # ── ENTRADA ACIONADA ──
-            # FIX: usa low <= entrada <= high (intracandle) OU tolerância 0.5%
             elif (low <= entrada <= high or abs(preco - entrada) <= tol_entrada) \
                     and not alerta_ja_enviado(f"{base}_entrada"):
                 marcar_alerta(f"{base}_entrada")
@@ -941,9 +886,6 @@ def monitorar_trades():
                     f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
                     f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
                 )
-
-            # ── ZONA DE APROXIMAÇÃO ──
-            # FIX: só dispara se entrada ainda NÃO foi acionada
             else:
                 if not alerta_ja_enviado(f"{base}_entrada"):
                     distancia_pct = (preco - entrada) / entrada * 100
@@ -956,12 +898,7 @@ def monitorar_trades():
                             f"⏳ Aguardando pullback para acionar..."
                         )
 
-        # ══════════════════════════════════════
-        # SHORT
-        # ══════════════════════════════════════
         elif direcao == "SHORT":
-
-            # ── STOP — verificar PRIMEIRO com continue ──
             if high >= stop and not alerta_ja_enviado(f"{base}_stop"):
                 marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
@@ -974,9 +911,7 @@ def monitorar_trades():
                     f"📋 Entrada: ${entrada} | Saída: ${preco:.6g}\n"
                     f"❌ LOSS | ⏱ {duracao}"
                 )
-                continue  # FIX: não verificar alvos após stop
-
-            # ── A3 ──
+                continue
             if low <= a3 and not alerta_ja_enviado(f"{base}_a3"):
                 marcar_alerta(f"{base}_a3")
                 marcar_alerta(f"{base}_a2")
@@ -992,8 +927,6 @@ def monitorar_trades():
                     f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
                     f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
                 )
-
-            # ── A2 ──
             elif low <= a2 and not alerta_ja_enviado(f"{base}_a2"):
                 marcar_alerta(f"{base}_a2")
                 marcar_alerta(f"{base}_a1")
@@ -1004,8 +937,6 @@ def monitorar_trades():
                     f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
                     f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
                 )
-
-            # ── A1 ──
             elif low <= a1 and not alerta_ja_enviado(f"{base}_a1"):
                 marcar_alerta(f"{base}_a1")
                 marcar_alerta(f"{base}_entrada")
@@ -1017,8 +948,6 @@ def monitorar_trades():
                     f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
-
-            # ── ENTRADA ACIONADA ──
             elif (low <= entrada <= high or abs(preco - entrada) <= tol_entrada) \
                     and not alerta_ja_enviado(f"{base}_entrada"):
                 marcar_alerta(f"{base}_entrada")
@@ -1029,8 +958,6 @@ def monitorar_trades():
                     f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
                     f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
                 )
-
-            # ── ZONA DE APROXIMAÇÃO ──
             else:
                 if not alerta_ja_enviado(f"{base}_entrada"):
                     distancia_pct = (entrada - preco) / entrada * 100
@@ -1043,9 +970,6 @@ def monitorar_trades():
                             f"⏳ Aguardando subida para acionar..."
                         )
 
-# ─────────────────────────────────────────────
-# RELATÓRIOS
-# ─────────────────────────────────────────────
 def relatorio_diario():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     total, wins, loss, abertos, wr = relatorio()
@@ -1131,9 +1055,6 @@ def relatorio_semanal():
         f"━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-# ─────────────────────────────────────────────
-# FLASK API
-# ─────────────────────────────────────────────
 @flask_app.route("/api/trades")
 def api_trades():
     try:
@@ -1178,7 +1099,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v12.1"})
+    return jsonify({"status": "online", "version": "v12.2"})
 
 @flask_app.route("/")
 @flask_app.route("/dashboard")
@@ -1214,7 +1135,7 @@ def dashboard():
 </style>
 </head>
 <body>
-<h1>🦈 LucSharkTrade Dashboard v12.1</h1>
+<h1>🦈 LucSharkTrade Dashboard v12.2</h1>
 <p class="refresh" id="refresh-time">Carregando...</p>
 <div class="cards" id="cards"></div>
 <div class="charts">
@@ -1285,23 +1206,20 @@ async function loadData(){
     <td class="${pnl(t.resultado)>=0?'win':'loss'}">${pnl(t.resultado)>=0?'+':''}$${pnl(t.resultado)}</td>
   </tr>`).join('');
   document.getElementById('refresh-time').textContent=
-    'Atualizado: '+new Date().toLocaleTimeString('pt-BR')+' BRT | v12.1 — Auto-refresh 30s';
+    'Atualizado: '+new Date().toLocaleTimeString('pt-BR')+' BRT | v12.2 — Auto-refresh 30s';
 }
 loadData();
 setInterval(loadData,30000);
 </script>
 </body></html>"""
 
-# ─────────────────────────────────────────────
-# COMANDOS TELEGRAM
-# ─────────────────────────────────────────────
 def processar_comando(texto):
     partes = texto.strip().split()
     cmd    = partes[0].lower()
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.1 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.2 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1456,26 +1374,20 @@ def processar_comando(texto):
         brt       = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
         ex_online = sum(1 for ex in EXCHANGES_CONFIG if ex["instance"])
         return (
-            f"✅ <b>LucSharkTrade v12.1 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.2 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
-            f"🔧 Monitoramento: HIGH/LOW intracandle\n"
+            f"🔧 Fix: atualizar_resultado sem ORDER BY no UPDATE\n"
             f"🔧 Tolerância entrada: 0.5%"
         )
 
     return None
 
-# ─────────────────────────────────────────────
-# FLASK THREAD
-# ─────────────────────────────────────────────
 def iniciar_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
 def main():
     init_db()
     init_exchanges()
@@ -1486,7 +1398,6 @@ def main():
 
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
 
-    # Evitar mensagem duplicada em restarts rápidos
     try:
         conn_s = sqlite3.connect("trades.db")
         cs     = conn_s.cursor()
@@ -1507,16 +1418,15 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.1 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.2 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
+            f"✅ Fix: sqlite ORDER BY no UPDATE corrigido\n"
             f"✅ Monitoramento HIGH/LOW intracandle\n"
             f"✅ Tolerância entrada: 0.5%\n"
-            f"✅ Stop com prioridade máxima\n"
-            f"✅ Alertas sem duplicatas\n\n"
+            f"✅ Stop com prioridade máxima\n\n"
             f"Envie /ajuda para ver os comandos."
         )
 
-    # Descartar mensagens pendentes
     ultimo_offset = None
     try:
         r = requests.get(
@@ -1571,7 +1481,6 @@ def main():
 
         monitorar_trades()
 
-        # Relatórios automáticos
         agora_brt = brt_agora()
         if agora_brt.hour == 18 and agora_brt.minute == 0:
             relatorio_diario()
