@@ -923,8 +923,10 @@ def monitorar_trades():
                     f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
-            elif (low <= entrada <= high or abs(preco - entrada) <= tol_entrada) \
-                    and not alerta_ja_enviado(f"{base}_entrada"):
+            elif low <= entrada and not alerta_ja_enviado(f"{base}_entrada"):
+                # FIX v12.5: removida tolerância abs() que disparava entrada
+                # em ambos os lados do nível. Agora só aciona se low intracandle
+                # tocou/cruzou a entrada (direção correta para LONG).
                 marcar_alerta(f"{base}_entrada")
                 marcar_alerta(f"{base}_zona")
                 enviar_telegram(
@@ -995,8 +997,10 @@ def monitorar_trades():
                     f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                     f"⏳ Aguardar A2: ${a2}"
                 )
-            elif (low <= entrada <= high or abs(preco - entrada) <= tol_entrada) \
-                    and not alerta_ja_enviado(f"{base}_entrada"):
+            elif high >= entrada and not alerta_ja_enviado(f"{base}_entrada"):
+                # FIX v12.5: removida tolerância abs() que disparava entrada
+                # em ambos os lados do nível. Agora só aciona se high intracandle
+                # tocou/cruzou a entrada (direção correta para SHORT).
                 marcar_alerta(f"{base}_entrada")
                 marcar_alerta(f"{base}_zona")
                 enviar_telegram(
@@ -1266,7 +1270,7 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.4 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.5 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1421,11 +1425,11 @@ def processar_comando(texto):
         brt       = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
         ex_online = sum(1 for ex in EXCHANGES_CONFIG if ex["instance"])
         return (
-            f"✅ <b>LucSharkTrade v12.4 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.5 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
-            f"🔧 v12.4 fix: high/low intracandle (não mais 24h) + guarda 60s pós-registro\n"
+            f"🔧 v12.5 fix: entrada SHORT/LONG agora só dispara na direção correta (sem tolerância ambígua)\n"
             f"🔧 Tolerância entrada: 0.5%"
         )
 
@@ -1570,7 +1574,7 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.4 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.5 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
             f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
             f"✅ FIX: monitoramento em thread dedicada\n"
