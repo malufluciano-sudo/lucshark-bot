@@ -717,17 +717,37 @@ def normalizar_symbol_ccxt(ativo):
             return f"{s[:-len(quote)]}/{quote}"
     return s
 
+def _high_low_intracandle(exchange_instance, symbol):
+    """
+    Retorna (high, low) do candle de 1 minuto MAIS RECENTE (em formação).
+    Isso evita usar ticker["high"]/["low"] que são valores das ULTIMAS 24h
+    e disparariam stops/alvos para movimentos antigos.
+    Retorna (None, None) se não conseguir buscar.
+    """
+    try:
+        ohlcv = exchange_instance.fetch_ohlcv(symbol, timeframe="1m", limit=2)
+        if ohlcv and len(ohlcv) >= 1:
+            last_candle = ohlcv[-1]  # [ts, open, high, low, close, volume]
+            return last_candle[2], last_candle[3]
+    except Exception as e:
+        log.debug(f"fetch_ohlcv 1m {symbol}: {e}")
+    return None, None
+
+
 def buscar_preco_atual(ativo):
     symbol = normalizar_symbol_ccxt(ativo)
     if CCXT_AVAILABLE:
         try:
             ticker = _exchange.fetch_ticker(symbol)
+            last_price = ticker["last"]
+            # FIX v12.4: usar high/low do candle 1m em formação, NÃO de 24h
+            high_1m, low_1m = _high_low_intracandle(_exchange, symbol)
             return {
-                "preco": ticker["last"],
-                "high":  ticker.get("high") or ticker["last"],
-                "low":   ticker.get("low") or ticker["last"],
-                "bid":   ticker.get("bid") or ticker["last"],
-                "ask":   ticker.get("ask") or ticker["last"],
+                "preco": last_price,
+                "high":  high_1m if high_1m is not None else last_price,
+                "low":   low_1m  if low_1m  is not None else last_price,
+                "bid":   ticker.get("bid") or last_price,
+                "ask":   ticker.get("ask") or last_price,
             }
         except Exception as e:
             log.debug(f"Ticker {symbol}: {e}")
@@ -735,17 +755,19 @@ def buscar_preco_atual(ativo):
         if ex["instance"]:
             try:
                 ticker = ex["instance"].fetch_ticker(symbol)
+                last_price = ticker["last"]
+                high_1m, low_1m = _high_low_intracandle(ex["instance"], symbol)
                 return {
-                    "preco": ticker["last"],
-                    "high":  ticker.get("high") or ticker["last"],
-                    "low":   ticker.get("low") or ticker["last"],
-                    "bid":   ticker.get("bid") or ticker["last"],
-                    "ask":   ticker.get("ask") or ticker["last"],
+                    "preco": last_price,
+                    "high":  high_1m if high_1m is not None else last_price,
+                    "low":   low_1m  if low_1m  is not None else last_price,
+                    "bid":   ticker.get("bid") or last_price,
+                    "ask":   ticker.get("ask") or last_price,
                 }
             except:
                 continue
     sym_lbank = symbol.lower().replace("/", "_")
-    candles   = buscar_candles(sym_lbank, "minute5", 3)
+    candles   = buscar_candles(sym_lbank, "minute1", 2)
     if candles:
         parsed = [parse_candle(c) for c in candles]
         parsed = [p for p in parsed if p is not None]
@@ -804,6 +826,25 @@ def calcular_duracao(criado_em):
     except:
         return "—"
 
+
+
+def _trade_pode_ser_avaliado_com_range(criado_em_str):
+    """
+    Retorna True se o trade existir há TEMPO SUFICIENTE para que o high/low
+    do candle 1m em formação represente movimento legítimo PÓS-criação.
+    Se o trade tem menos de 60s, retornamos False para forçar avaliação só com 'preco' (last).
+    Evita disparos espúrios logo após o registro do trade.
+    """
+    try:
+        fmt = "%Y-%m-%d %H:%M"
+        abertura = datetime.strptime(criado_em_str, fmt)
+        agora = brt_agora().replace(tzinfo=None)
+        delta_s = (agora - abertura).total_seconds()
+        return delta_s >= 60
+    except Exception:
+        return True
+
+
 def monitorar_trades():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -822,6 +863,12 @@ def monitorar_trades():
         preco = dados["preco"]
         high  = dados.get("high", preco)
         low   = dados.get("low", preco)
+
+        # FIX v12.4: se trade tem <60s, ignorar range intracandle pré-existente
+        # (high/low do candle 1m pode ter sido feito antes do trade ser registrado)
+        if not _trade_pode_ser_avaliado_com_range(criado):
+            high = preco
+            low  = preco
 
         base        = f"{tid}_{ativo}"
         tol_entrada = entrada * 0.005
@@ -1219,7 +1266,7 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.3 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.4 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1374,11 +1421,11 @@ def processar_comando(texto):
         brt       = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
         ex_online = sum(1 for ex in EXCHANGES_CONFIG if ex["instance"])
         return (
-            f"✅ <b>LucSharkTrade v12.3 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.4 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
-            f"🔧 v12.3: comandos Telegram em thread dedicada\n"
+            f"🔧 v12.4 fix: high/low intracandle (não mais 24h) + guarda 60s pós-registro\n"
             f"🔧 Tolerância entrada: 0.5%"
         )
 
@@ -1523,7 +1570,7 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.3 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.4 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
             f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
             f"✅ FIX: monitoramento em thread dedicada\n"
