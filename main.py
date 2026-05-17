@@ -352,101 +352,213 @@ def parse_candle(c):
         pass
     return None
 
-def analisar_ativo(symbol, candles):
-    parsed = [parse_candle(c) for c in candles]
-    parsed = [p for p in parsed if p is not None]
-    if len(parsed) < 20:
+
+# ============================================================
+# SCANNER METODOLOGIA AGREGADO v12.5
+# Top-Down 1H -> 15M | Tuk Tuk | VWAP Ancorado | Sem RSI
+# ============================================================
+
+def calcular_vwap_ancorado(candles):
+    """VWAP ancorado no inicio da serie de candles fornecida."""
+    num = 0.0
+    den = 0.0
+    for c in candles:
+        tp = (c["h"] + c["l"] + c["c"]) / 3
+        num += tp * c["v"]
+        den += c["v"]
+    return num / den if den > 0 else 0
+
+def detectar_bias_1h(candles_1h):
+    """
+    Detecta bias estrutural no 1H por sequencia de HH/HL ou LH/LL.
+    Retorna: "LONG", "SHORT" ou "NEUTRO"
+    """
+    if len(candles_1h) < 10:
+        return "NEUTRO"
+    highs  = [c["h"] for c in candles_1h]
+    lows   = [c["l"] for c in candles_1h]
+    closes = [c["c"] for c in candles_1h]
+
+    # Swing highs e lows simples (janela de 3)
+    swing_highs = []
+    swing_lows  = []
+    for i in range(1, len(highs) - 1):
+        if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+            swing_highs.append(highs[i])
+        if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+            swing_lows.append(lows[i])
+
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        hh = swing_highs[-1] > swing_highs[-2]  # Higher High
+        hl = swing_lows[-1]  > swing_lows[-2]   # Higher Low
+        lh = swing_highs[-1] < swing_highs[-2]  # Lower High
+        ll = swing_lows[-1]  < swing_lows[-2]   # Lower Low
+        if hh and hl:
+            return "LONG"
+        if lh and ll:
+            return "SHORT"
+    return "NEUTRO"
+
+def detectar_tuk_tuk(candles_15m, atr_medio):
+    """
+    Detecta padrao Tuk Tuk de Wyckoff no 15M.
+    Definicao: candles de baixa amplitude + volume crescente dentro de range
+               -> vela de grande amplitude + alto volume no rompimento.
+    Retorna: "LONG", "SHORT" ou None
+    """
+    if len(candles_15m) < 10 or atr_medio <= 0:
         return None
-    highs   = [p["h"] for p in parsed]
-    lows    = [p["l"] for p in parsed]
-    closes  = [p["c"] for p in parsed]
-    volumes = [p["v"] for p in parsed]
-    preco   = closes[-1]
-    vol_rel = volume_relativo(volumes)
-    rsi     = calcular_rsi(closes)
-    vwap    = calcular_vwap(candles[-20:])
-    ema9    = calcular_ema(closes, 9)
-    ema21   = calcular_ema(closes, 21)
-    janela  = closes[-MIN_CANDLES_RANGE:]
-    suporte = min(janela)
-    resist  = max(janela)
-    sinais  = []
-    if vol_rel >= MULT_ALERTA:
-        if closes[-1] > resist:
-            forca = "FORTE" if vol_rel >= MULT_FORTE else "MÉDIO" if vol_rel >= MULT_MEDIO else "ALERTA"
-            sinais.append({"tipo": f"🚀 Breakout LONG [{forca}]", "forca": forca,
-                           "detalhe": f"Rompeu ${resist:.4f} | Vol {vol_rel}x"})
-        elif closes[-1] < suporte:
-            forca = "FORTE" if vol_rel >= MULT_FORTE else "MÉDIO" if vol_rel >= MULT_MEDIO else "ALERTA"
-            sinais.append({"tipo": f"📉 Breakout SHORT [{forca}]", "forca": forca,
-                           "detalhe": f"Rompeu ${suporte:.4f} | Vol {vol_rel}x"})
-    if len(closes) >= 15:
-        amp_rec = sum(highs[i] - lows[i] for i in range(-5, 0)) / 5
-        amp_ant = sum(highs[i] - lows[i] for i in range(-15, -5)) / 10
-        vol_rec = sum(volumes[-5:]) / 5
-        vol_ant = sum(volumes[-15:-5]) / 10
-        if amp_ant > 0 and amp_rec < amp_ant * 0.6 and vol_rec < vol_ant * 0.8:
-            sinais.append({"tipo": "⚡ Compressão [ALERTA]", "forca": "ALERTA",
-                           "detalhe": f"Volatilidade -{round((1-amp_rec/amp_ant)*100)}% | Vol caindo"})
-    if vwap > 0 and abs(preco - vwap) / vwap < 0.003 and vol_rel >= MULT_MEDIO:
-        direcao = "LONG" if preco > vwap else "SHORT"
-        forca = "MÉDIO" if vol_rel >= MULT_MEDIO else "ALERTA"
-        sinais.append({"tipo": f"📍 Toque VWAP {direcao} [{forca}]", "forca": forca,
-                       "detalhe": f"VWAP ${vwap:.4f} | Preço ${preco:.4f}"})
-    if rsi < RSI_SOBREVENDA and closes[-1] > closes[-2]:
-        sinais.append({"tipo": "🔄 RSI Reversão LONG [ALERTA]", "forca": "ALERTA",
-                       "detalhe": f"RSI {rsi} | Sobrevenda com vela de recuperação"})
-    elif rsi > RSI_SOBRECOMPRA and closes[-1] < closes[-2]:
-        sinais.append({"tipo": "🔄 RSI Reversão SHORT [ALERTA]", "forca": "ALERTA",
-                       "detalhe": f"RSI {rsi} | Sobrecompra com vela de rejeição"})
-    if vol_rel >= 3.0:
-        sinais.append({"tipo": "🌊 Volume Climático [FORTE]", "forca": "FORTE",
-                       "detalhe": f"Vol {vol_rel}x → possível Spring ou Upthrust Wyckoff"})
-    if len(ema9) >= 2 and len(ema21) >= 2:
-        if ema9[-2] <= ema21[-2] and ema9[-1] > ema21[-1] and vol_rel >= MULT_MEDIO:
-            sinais.append({"tipo": "✂️ EMA Cross LONG [MÉDIO]", "forca": "MÉDIO",
-                           "detalhe": f"EMA9 cruzou EMA21 para cima | Vol {vol_rel}x"})
-        elif ema9[-2] >= ema21[-2] and ema9[-1] < ema21[-1] and vol_rel >= MULT_MEDIO:
-            sinais.append({"tipo": "✂️ EMA Cross SHORT [MÉDIO]", "forca": "MÉDIO",
-                           "detalhe": f"EMA9 cruzou EMA21 para baixo | Vol {vol_rel}x"})
-    if not sinais:
+
+    LOOKBACK     = 5    # barras de compressao
+    FATOR_COMP   = 0.75 # amplitude < 0.75x ATR = comprimido
+    FATOR_EXP    = 1.8  # amplitude > 1.8x ATR = grande
+    FATOR_FLAT   = 3.5  # range da janela < 3.5x ATR = lateralizacao
+    VOL_ZSCORE   = 1.8  # volume da barra atual vs media
+
+    # Barra atual (rompimento)
+    atual = candles_15m[-1]
+    amp_atual = atual["h"] - atual["l"]
+
+    # Fase 1: verificar compressao nas N barras anteriores
+    janela = candles_15m[-(LOOKBACK+1):-1]  # 5 barras antes da atual
+    if len(janela) < LOOKBACK:
         return None
-    ordem = {"FORTE": 3, "MÉDIO": 2, "ALERTA": 1}
-    forca_max = max(sinais, key=lambda s: ordem.get(s["forca"], 0))["forca"]
+
+    # Amplitude baixa em todas as barras
+    amps = [c["h"] - c["l"] for c in janela]
+    comp_ok = all(a < atr_medio * FATOR_COMP for a in amps)
+    if not comp_ok:
+        return None
+
+    # Volume crescente (maioria dos pares consecutivos)
+    vols = [c["v"] for c in janela]
+    pares_crescentes = sum(1 for i in range(1, len(vols)) if vols[i] > vols[i-1])
+    vol_cresc_ok = pares_crescentes >= max(1, LOOKBACK - 2)
+    if not vol_cresc_ok:
+        return None
+
+    # Range da janela flat (lateralizacao real)
+    rh = max(c["h"] for c in janela)
+    rl = min(c["l"] for c in janela)
+    if (rh - rl) >= FATOR_FLAT * atr_medio:
+        return None
+
+    # Fase 2: barra atual com grande amplitude e alto volume
+    if amp_atual <= atr_medio * FATOR_EXP:
+        return None
+
+    vols_hist = [c["v"] for c in candles_15m[:-1]]
+    mean_vol  = sum(vols_hist) / len(vols_hist) if vols_hist else 0
+    std_vol   = (sum((v - mean_vol)**2 for v in vols_hist) / len(vols_hist))**0.5 if vols_hist else 0
+    zscore    = (atual["v"] - mean_vol) / std_vol if std_vol > 0 else 0
+    if zscore < VOL_ZSCORE:
+        return None
+
+    # Direcao do breakout
+    if atual["c"] > rh and atual["c"] >= atual["o"]:  # fecha acima do range = LONG
+        return "LONG"
+    if atual["c"] < rl and atual["c"] <= atual["o"]:  # fecha abaixo do range = SHORT
+        return "SHORT"
+    return None
+
+def calcular_atr(candles, periodo=14):
+    """ATR medio simples."""
+    if len(candles) < periodo:
+        return 0
+    trs = []
+    for i in range(1, len(candles)):
+        hl = candles[i]["h"] - candles[i]["l"]
+        hc = abs(candles[i]["h"] - candles[i-1]["c"])
+        lc = abs(candles[i]["l"] - candles[i-1]["c"])
+        trs.append(max(hl, hc, lc))
+    return sum(trs[-periodo:]) / periodo if trs else 0
+
+def analisar_ativo_agregado(symbol):
+    """
+    Analise completa com metodologia Agregado.
+    Top-Down 1H -> 15M | Tuk Tuk | VWAP Ancorado.
+    Retorna dict com resultado ou None se nao passou.
+    """
+    # ── 1H: contexto e bias estrutural ──────────────────────
+    candles_1h_raw = buscar_candles(symbol, "hour1", 60)
+    if not candles_1h_raw:
+        return None
+    candles_1h = [parse_candle(c) for c in candles_1h_raw]
+    candles_1h = [c for c in candles_1h if c]
+    if len(candles_1h) < 20:
+        return None
+
+    bias_1h = detectar_bias_1h(candles_1h)
+    if bias_1h == "NEUTRO":
+        return None  # sem bias definido = sem edge
+
+    # ── 15M: filtro de volume e Tuk Tuk ─────────────────────
+    candles_15m_raw = buscar_candles(symbol, "minute15", 60)
+    if not candles_15m_raw:
+        return None
+    candles_15m = [parse_candle(c) for c in candles_15m_raw]
+    candles_15m = [c for c in candles_15m if c]
+    if len(candles_15m) < 20:
+        return None
+
+    # Volume relativo no 15M
+    vols_15m = [c["v"] for c in candles_15m]
+    vol_rel  = volume_relativo(vols_15m)
+    if vol_rel < 5.0:
+        return None
+
+    # ATR do 15M
+    atr_15m = calcular_atr(candles_15m, 14)
+    if atr_15m <= 0:
+        return None
+
+    # Tuk Tuk obrigatorio
+    tuk_dir = detectar_tuk_tuk(candles_15m, atr_15m)
+    if tuk_dir is None:
+        return None
+
+    # Tuk Tuk deve estar alinhado com o bias do 1H
+    if tuk_dir != bias_1h:
+        return None
+
+    # ── VWAP ancorado no inicio do movimento 1H ─────────────
+    # Ancora no candle mais baixo (LONG) ou mais alto (SHORT) das ultimas 20 barras 1H
+    if bias_1h == "LONG":
+        idx_ancora = min(range(len(candles_1h[-20:])), key=lambda i: candles_1h[-20:][i]["l"])
+        candles_ancora = candles_1h[-20:][idx_ancora:]
+    else:
+        idx_ancora = max(range(len(candles_1h[-20:])), key=lambda i: candles_1h[-20:][i]["h"])
+        candles_ancora = candles_1h[-20:][idx_ancora:]
+
+    vwap_ancorado = calcular_vwap_ancorado(candles_ancora) if len(candles_ancora) >= 2 else 0
+
+    preco = candles_15m[-1]["c"]
+
+    # Para LONG: preco deve estar acima do VWAP ancorado (ou proximo)
+    # Para SHORT: preco deve estar abaixo do VWAP ancorado (ou proximo)
+    if vwap_ancorado > 0:
+        if bias_1h == "LONG"  and preco < vwap_ancorado * 0.98:
+            return None  # preco muito abaixo do VWAP = sem edge long
+        if bias_1h == "SHORT" and preco > vwap_ancorado * 1.02:
+            return None  # preco muito acima do VWAP = sem edge short
+
+    # ── Score de qualidade ───────────────────────────────────
     score = 0
-    if vol_rel >= 10:   score += 40
-    elif vol_rel >= 5:  score += 25
-    elif vol_rel >= 2:  score += 10
-    if rsi < 25 or rsi > 75:   score += 20
-    elif rsi < 35 or rsi > 65: score += 10
-    if len(ema9) >= 2 and len(ema21) >= 2:
-        bull_trend  = ema9[-1] > ema21[-1] and closes[-1] > ema9[-1]
-        bear_trend  = ema9[-1] < ema21[-1] and closes[-1] < ema9[-1]
-        long_sinal  = any("LONG" in s["tipo"] for s in sinais)
-        short_sinal = any("SHORT" in s["tipo"] for s in sinais)
-        if (long_sinal and bull_trend) or (short_sinal and bear_trend):
-            score += 20
-    if forca_max == "FORTE":   score += 20
-    elif forca_max == "MÉDIO": score += 10
-    exchange_label = ""
-    if "@" in symbol:
-        _, ex_id = symbol.rsplit("@", 1)
-        for ex in EXCHANGES_CONFIG:
-            if ex["id"] == ex_id:
-                exchange_label = ex["label"]
-                break
+    if vol_rel >= 10: score += 40
+    elif vol_rel >= 7: score += 25
+    else:              score += 10
+    score += 40  # Tuk Tuk confirmado = peso alto
+    if vwap_ancorado > 0: score += 20
+
     return {
-        "symbol":      symbol.split("@")[0].upper(),
-        "preco":       preco,
-        "vol_rel":     vol_rel,
-        "rsi":         rsi,
-        "vwap":        round(vwap, 4),
-        "suporte":     round(suporte, 4),
-        "resistencia": round(resist, 4),
-        "sinais":      sinais,
-        "forca_max":   forca_max,
-        "score":       min(score, 100),
-        "exchange":    exchange_label,
+        "symbol":        symbol.split("@")[0].upper(),
+        "preco":         preco,
+        "bias_1h":       bias_1h,
+        "tuk_tuk":       tuk_dir,
+        "vol_rel_15m":   round(vol_rel, 1),
+        "vwap_ancorado": round(vwap_ancorado, 6),
+        "score":         min(score, 100),
+        "atr_15m":       round(atr_15m, 6),
     }
 
 def normalizar_symbol_coinalyze(symbol):
@@ -590,11 +702,19 @@ def remover_blacklist(ativo):
     conn.commit()
     conn.close()
 
+
 def rodar_scanner():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
-    enviar_telegram(f"🔍 <b>SCANNER LucSharkTrade</b>\n{brt} | TF: 15M\nAnalisando ativos...")
+    enviar_telegram(
+        f"🔍 <b>SCANNER AGREGADO v12.5</b>\n"
+        f"{brt}\n"
+        f"Top-Down 1H→15M | Tuk Tuk | VWAP Ancorado\n"
+        f"Analisando ativos..."
+    )
     tickers   = buscar_ticker_24h()
     pares_raw = buscar_todos_pares()
+
+    # Filtro de volume minimo de mercado
     pares = []
     for p in pares_raw:
         t = tickers.get(p)
@@ -605,83 +725,88 @@ def rodar_scanner():
         else:
             pares.append(p)
     pares = pares[:600]
-    log.info(f"Analisando {len(pares)} ativos...")
-    prioridade_max  = []
-    alta_prioridade = []
-    blacklist = get_blacklist()
+
+    blacklist  = get_blacklist()
+    resultados = []
+    n_analisados = 0
+
     for symbol in pares:
         if symbol.upper() in blacklist:
             continue
         try:
-            candles = buscar_candles(symbol)
-            if not candles:
-                continue
-            parsed = [parse_candle(c) for c in candles]
-            parsed = [p for p in parsed if p is not None]
-            if len(parsed) < 20:
-                continue
-            closes  = [p["c"] for p in parsed]
-            volumes = [p["v"] for p in parsed]
-            vol_rel = volume_relativo(volumes)
-            if vol_rel < 5.0:
-                continue
-            rsi = calcular_rsi(closes)
-            if rsi >= 40 and rsi <= 60:
-                continue
-            vies       = "LONG" if rsi < 40 else "SHORT"
-            vies_emoji = "🟢" if vies == "LONG" else "🔴"
-            vwap       = calcular_vwap(parsed[-20:])
-            suporte    = round(min(p["l"] for p in parsed[-5:]), 6)
-            resist     = round(max(p["h"] for p in parsed[-5:]), 6)
-            preco      = closes[-1]
-            resultado  = {
-                "symbol": symbol.upper(), "preco": preco,
-                "vol_rel": vol_rel, "rsi": rsi,
-                "vwap": round(vwap, 6), "suporte": suporte,
-                "resist": resist, "vies": vies, "vies_emoji": vies_emoji
-            }
-            if vol_rel >= 10.0:
-                prioridade_max.append(resultado)
-            else:
-                alta_prioridade.append(resultado)
-            time.sleep(0.15)
+            resultado = analisar_ativo_agregado(symbol)
+            n_analisados += 1
+            if resultado:
+                resultados.append(resultado)
+            time.sleep(0.2)  # respeitar rate limit
         except Exception as e:
-            log.error(f"Erro {symbol}: {e}")
-    prioridade_max.sort(key=lambda x: x["vol_rel"], reverse=True)
-    alta_prioridade.sort(key=lambda x: x["vol_rel"], reverse=True)
-    total = len(prioridade_max) + len(alta_prioridade)
-    if total == 0:
-        enviar_telegram(f"✅ <b>SCAN CONCLUÍDO</b>\n{brt}\nNenhum ativo com Vol ≥5x e RSI extremo.")
+            log.error(f"Scanner {symbol}: {e}")
+
+    # Ordenar por score decrescente
+    resultados.sort(key=lambda x: x["score"], reverse=True)
+
+    if not resultados:
+        enviar_telegram(
+            f"✅ <b>SCAN CONCLUÍDO</b>\n"
+            f"{brt}\n"
+            f"Analisados: {n_analisados} ativos\n"
+            f"Nenhum ativo com Tuk Tuk + Bias 1H + Vol ≥5x alinhados."
+        )
         return
-    linhas = [f"━━━━━━━━━━━━━━━━━━━━━━━━", f"📊 <b>SCANNER LucSharkTrade</b>",
-              f"🕐 {brt}", f"━━━━━━━━━━━━━━━━━━━━━━━━", ""]
-    if prioridade_max:
-        linhas.append(f"🚨 <b>PRIORIDADE MÁXIMA — Vol &gt;10x</b>\n")
-        for i, r in enumerate(prioridade_max, 1):
+
+    # Separar por prioridade e direcao
+    longs  = [r for r in resultados if r["bias_1h"] == "LONG"]
+    shorts = [r for r in resultados if r["bias_1h"] == "SHORT"]
+
+    linhas = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>SCANNER AGREGADO</b>",
+        f"🕐 {brt}",
+        f"✅ {len(resultados)} setups | {n_analisados} analisados",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    if longs:
+        linhas.append(f"🟢 <b>LONG — Tuk Tuk ▲ alinhado com 1H</b>\n")
+        for i, r in enumerate(longs, 1):
+            vwap_txt = f" | VWAP ${r['vwap_ancorado']:.5g}" if r["vwap_ancorado"] > 0 else ""
+            linhas.append(
+                f"{i}. <b>{r['symbol']}</b> ▲"
+                f" | Vol <b>{r['vol_rel_15m']}x</b>"
+                f" | Score {r['score']}"
+                f" | 💲{r['preco']:.6g}"
+                f"{vwap_txt}"
+            )
+            # Sentimento resumido
             sent     = buscar_sentimento(r["symbol"])
             sent_txt = formatar_sentimento(sent)
-            linhas.append(
-                f"{i}. <b>{r['symbol']}</b> {r['vies_emoji']} {r['vies']}"
-                f" | Vol <b>{r['vol_rel']}x</b> | RSI {r['rsi']} | 💲{r['preco']:.6g}"
-            )
             if sent_txt:
                 linhas.append(sent_txt)
             linhas.append("")
-    if alta_prioridade:
-        linhas.append(f"⚡ <b>ALTA PRIORIDADE — Vol 5–10x</b>\n")
-        for i, r in enumerate(alta_prioridade, 1):
+
+    if shorts:
+        linhas.append(f"🔴 <b>SHORT — Tuk Tuk ▼ alinhado com 1H</b>\n")
+        for i, r in enumerate(shorts, 1):
+            vwap_txt = f" | VWAP ${r['vwap_ancorado']:.5g}" if r["vwap_ancorado"] > 0 else ""
+            linhas.append(
+                f"{i}. <b>{r['symbol']}</b> ▼"
+                f" | Vol <b>{r['vol_rel_15m']}x</b>"
+                f" | Score {r['score']}"
+                f" | 💲{r['preco']:.6g}"
+                f"{vwap_txt}"
+            )
             sent     = buscar_sentimento(r["symbol"])
             sent_txt = formatar_sentimento(sent)
-            linhas.append(
-                f"{i}. <b>{r['symbol']}</b> {r['vies_emoji']} {r['vies']}"
-                f" | Vol <b>{r['vol_rel']}x</b> | RSI {r['rsi']} | 💲{r['preco']:.6g}"
-            )
             if sent_txt:
                 linhas.append(sent_txt)
             linhas.append("")
-    linhas += [f"━━━━━━━━━━━━━━━━━━━━━━━━",
-               f"Total analisados: {len(pares)}", "",
-               f"👁 Escolha o ativo e envie o print para análise!"]
+
+    linhas += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "👁 Envie o gráfico do ativo para análise completa!"
+    ]
+
     mensagem = "\n".join(linhas)
     if len(mensagem) <= 4000:
         enviar_telegram(mensagem)
@@ -699,7 +824,8 @@ def rodar_scanner():
                 chars += len(linha)
         if bloco:
             enviar_telegram("\n".join(bloco))
-    log.info(f"Scan concluído. Max:{len(prioridade_max)} Alta:{len(alta_prioridade)}")
+
+    log.info(f"Scanner Agregado: {len(resultados)} setups de {n_analisados} ativos.")
 
 def rodar_scanner_debug():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
