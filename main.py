@@ -67,6 +67,20 @@ def init_db():
             criado_em TEXT
         )
     """)
+    # v12.5: alertas de nivel de preco independentes de trades
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS alertas_nivel (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ativo TEXT NOT NULL,
+            direcao TEXT NOT NULL,
+            nivel REAL NOT NULL,
+            condicao TEXT NOT NULL,
+            nota TEXT,
+            ativo_flag INTEGER DEFAULT 1,
+            disparado INTEGER DEFAULT 0,
+            criado_em TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -718,7 +732,7 @@ def normalizar_symbol_ccxt(ativo):
     return s
 
 def buscar_preco_atual(ativo):
-    # ── CORREÇÃO CRÍTICA v12.4 ──────────────────────────────────────────────
+    # ── CORREÇÃO CRÍTICA v12.5 ──────────────────────────────────────────────
     # ticker.get("high"/"low") retorna high/low das ÚLTIMAS 24H — não do
     # momento atual. Isso causava acionamentos falsos: um trade cadastrado
     # com entrada $10.00 era "acionado" porque o high 24h havia tocado $10.87
@@ -827,6 +841,99 @@ def calcular_duracao(criado_em):
     except:
         return "—"
 
+
+# ============================================================
+# ALERTAS DE NIVEL DE PRECO (v12.5)
+# ============================================================
+# Permite cadastrar alertas de nivel sem abrir trade.
+# Comandos: /alerta, /alertas, /deletar_alerta
+# Monitorado no mesmo loop de monitorar_trades.
+# ============================================================
+
+def salvar_alerta_nivel(ativo, direcao, nivel, condicao, nota=""):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    agora = brt_agora().strftime("%Y-%m-%d %H:%M")
+    c.execute("""
+        INSERT INTO alertas_nivel (ativo, direcao, nivel, condicao, nota, criado_em)
+        VALUES (?,?,?,?,?,?)
+    """, (ativo.upper(), direcao.upper(), nivel, condicao, nota, agora))
+    conn.commit()
+    aid = c.lastrowid
+    conn.close()
+    return aid
+
+def listar_alertas_nivel():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, ativo, direcao, nivel, condicao, nota, criado_em
+        FROM alertas_nivel
+        WHERE ativo_flag=1 AND disparado=0
+        ORDER BY id DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def deletar_alerta_nivel(aid):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("UPDATE alertas_nivel SET ativo_flag=0 WHERE id=?", (aid,))
+    conn.commit()
+    conn.close()
+
+def marcar_alerta_nivel_disparado(aid):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("UPDATE alertas_nivel SET disparado=1, ativo_flag=0 WHERE id=?", (aid,))
+    conn.commit()
+    conn.close()
+
+def monitorar_alertas_nivel():
+    """Verifica alertas de nivel de preco e dispara notificacao."""
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, ativo, direcao, nivel, condicao, nota
+        FROM alertas_nivel
+        WHERE ativo_flag=1 AND disparado=0
+    """)
+    alertas = c.fetchall()
+    conn.close()
+
+    for alerta in alertas:
+        aid, ativo, direcao, nivel, condicao, nota = alerta
+        dados = buscar_preco_atual(ativo)
+        if not dados:
+            continue
+        preco = dados["preco"]
+        high  = dados.get("high", preco)
+        low   = dados.get("low", preco)
+
+        disparar = False
+        # ACIMA: preco sobe e toca o nivel
+        if condicao == "ACIMA" and high >= nivel:
+            disparar = True
+        # ABAIXO: preco cai e toca o nivel
+        elif condicao == "ABAIXO" and low <= nivel:
+            disparar = True
+
+        if disparar:
+            marcar_alerta_nivel_disparado(aid)
+            emoji = "🔔"
+            seta  = "▲" if condicao == "ACIMA" else "▼"
+            msg_nota = f"\n📝 {nota}" if nota else ""
+            enviar_telegram(
+                f"{emoji} <b>ALERTA ACIONADO #{aid}</b>\n"
+                f"📊 {ativo} | {direcao}\n"
+                f"💲 Preço: ${preco:.6g} | Nível: ${nivel} {seta}\n"
+                f"✅ Nível atingido — verificar setup!{msg_nota}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"Envie o gráfico para análise completa."
+            )
+            log.info(f"Alerta #{aid} {ativo} disparado em ${preco:.6g}")
+
 def monitorar_trades():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -839,7 +946,7 @@ def monitorar_trades():
     for trade in abertos:
         tid, ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, resultado, criado = trade
 
-        # ── CORREÇÃO CRÍTICA v12.4 — FILTRO TEMPORAL ───────────────────────
+        # ── CORREÇÃO CRÍTICA v12.5 — FILTRO TEMPORAL ───────────────────────
         # Um trade PENDING só deve ser monitorado APÓS o momento do cadastro.
         # Isso evita que o bot ative entradas usando dados de preço anteriores
         # ao cadastro (ex: LINK cadastrado às 13:57 com entrada $10.00 —
@@ -1146,7 +1253,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v12.4"})
+    return jsonify({"status": "online", "version": "v12.5"})
 
 @flask_app.route("/")
 @flask_app.route("/dashboard")
@@ -1182,7 +1289,7 @@ def dashboard():
 </style>
 </head>
 <body>
-<h1>🦈 LucSharkTrade Dashboard v12.4</h1>
+<h1>🦈 LucSharkTrade Dashboard v12.5</h1>
 <p class="refresh" id="refresh-time">Carregando...</p>
 <div class="cards" id="cards"></div>
 <div class="charts">
@@ -1253,7 +1360,7 @@ async function loadData(){
     <td class="${pnl(t.resultado)>=0?'win':'loss'}">${pnl(t.resultado)>=0?'+':''}$${pnl(t.resultado)}</td>
   </tr>`).join('');
   document.getElementById('refresh-time').textContent=
-    'Atualizado: '+new Date().toLocaleTimeString('pt-BR')+' BRT | v12.4 — Auto-refresh 30s';
+    'Atualizado: '+new Date().toLocaleTimeString('pt-BR')+' BRT | v12.5 — Auto-refresh 30s';
 }
 loadData();
 setInterval(loadData,30000);
@@ -1266,7 +1373,7 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.4 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.5 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1274,6 +1381,10 @@ def processar_comando(texto):
             "/trades — trades abertos\n"
             "/relatorio — estatísticas e P&L\n"
             "/semana — relatório da semana\n\n"
+            "<b>🔔 ALERTAS DE NÍVEL</b>\n"
+            "/alerta ATIVO DIR NIVEL ACIMA|ABAIXO [nota]\n"
+            "/alertas — ver alertas ativos\n"
+            "/deletar_alerta ID — remover alerta\n\n"
             "<b>🔍 SCANNER</b>\n"
             "/scan — rodar scanner agora\n"
             "/ativos — exchanges monitoradas\n\n"
@@ -1364,6 +1475,67 @@ def processar_comando(texto):
             return f"❌ Erro: {e}"
 
 
+
+    elif cmd == "/alerta":
+        # /alerta ATIVO DIRECAO NIVEL CONDICAO [nota...]
+        # Ex: /alerta HYPEUSDT LONG 44000 ACIMA gatilho possivel long
+        # Ex: /alerta HYPEUSDT SHORT 38000 ABAIXO possivel short
+        if len(partes) < 5:
+            return (
+                "❌ Formato: /alerta ATIVO DIRECAO NIVEL CONDICAO [nota]\n\n"
+                "DIRECAO: LONG ou SHORT\n"
+                "CONDICAO: ACIMA ou ABAIXO\n\n"
+                "Exemplos:\n"
+                "/alerta HYPEUSDT LONG 44000 ACIMA gatilho long\n"
+                "/alerta BTCUSDT SHORT 82000 ACIMA rejeicao resistencia"
+            )
+        try:
+            ativo     = partes[1].upper()
+            direcao   = partes[2].upper()
+            nivel     = float(partes[3])
+            condicao  = partes[4].upper()
+            nota      = " ".join(partes[5:]) if len(partes) > 5 else ""
+            if direcao not in ("LONG", "SHORT"):
+                return "❌ DIRECAO deve ser LONG ou SHORT"
+            if condicao not in ("ACIMA", "ABAIXO"):
+                return "❌ CONDICAO deve ser ACIMA ou ABAIXO"
+            aid = salvar_alerta_nivel(ativo, direcao, nivel, condicao, nota)
+            seta = "▲" if condicao == "ACIMA" else "▼"
+            return (
+                f"🔔 <b>Alerta #{aid} cadastrado!</b>\n"
+                f"📊 {ativo} | {direcao}\n"
+                f"💲 Nível: ${nivel} {seta} ({condicao})\n"
+                f"{'📝 ' + nota if nota else ''}\n"
+                f"✅ Monitorando 24/7 — aviso quando atingir o nível."
+            )
+        except Exception as e:
+            return f"❌ Erro: {e}"
+
+    elif cmd == "/alertas":
+        rows = listar_alertas_nivel()
+        if not rows:
+            return "📭 Nenhum alerta de nível ativo."
+        linhas = ["🔔 <b>Alertas de Nível Ativos</b>\n"]
+        for r in rows:
+            aid, ativo, direcao, nivel, condicao, nota, criado = r
+            seta  = "▲" if condicao == "ACIMA" else "▼"
+            emoji = "🟢" if direcao == "LONG" else "🔴"
+            linha = f"{emoji} #{aid} {ativo} {direcao} | ${nivel} {seta}"
+            if nota:
+                linha += f" | {nota}"
+            linhas.append(linha)
+        linhas.append("\n/deletar_alerta ID — para remover um alerta")
+        return "\n".join(linhas)
+
+    elif cmd == "/deletar_alerta":
+        if len(partes) < 2:
+            return "❌ Formato: /deletar_alerta ID"
+        try:
+            aid = int(partes[1])
+            deletar_alerta_nivel(aid)
+            return f"🗑 Alerta #{aid} removido."
+        except Exception as e:
+            return f"❌ Erro: {e}"
     elif cmd == "/trades":
         rows = listar_trades()
         if not rows:
@@ -1476,13 +1648,13 @@ def processar_comando(texto):
         n_abertos = c_st.fetchone()[0]
         conn_st.close()
         return (
-            f"✅ <b>LucSharkTrade v12.4 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.5 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
             f"🔄 Trades abertos: {n_abertos}\n"
             f"⏱ Intervalo monitor: {INTERVALO_SEG}s\n"
-            f"🔧 v12.4: intracandle high/low + filtro temporal + alvos pos-entrada"
+            f"🔧 v12.5: intracandle high/low + filtro temporal + alvos pos-entrada"
         )
 
     return None
@@ -1492,7 +1664,7 @@ def iniciar_flask():
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # =========================================================================
-# v12.4 — FIX: Comandos Telegram não respondiam
+# v12.5 — FIX: Comandos Telegram não respondiam
 #   1. RELAXADO filtro de idade (60s -> 600s) — era a causa raiz dos descartes
 #   2. SEPARADO loop de comandos (rápido) do loop de monitoramento (lento)
 #   3. monitorar_trades() agora roda em thread dedicada
@@ -1519,6 +1691,11 @@ def loop_monitor_trades():
                 _estado["ultimo_monitor"] = time.time()
         except Exception as e:
             log.error(f"monitorar_trades erro: {e}")
+
+        try:
+            monitorar_alertas_nivel()
+        except Exception as e:
+            log.error(f"monitorar_alertas_nivel erro: {e}")
 
         # Relatórios automáticos (deduplicados via chave de janela)
         try:
@@ -1569,7 +1746,7 @@ def loop_comandos_telegram():
             if not texto or not texto.startswith("/"):
                 continue
 
-            # FIX v12.4: filtro relaxado — só descarta msgs MUITO antigas (>10min).
+            # FIX v12.5: filtro relaxado — só descarta msgs MUITO antigas (>10min).
             # Antes era 60s, o que descartava comandos legítimos porque o loop
             # ficava bloqueado em monitorar_trades() + sleep(30s) na mesma thread.
             msg_date = msg.get("date", 0)
@@ -1626,7 +1803,7 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.4 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.5 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
             f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
             f"✅ FIX: monitoramento em thread dedicada\n"
@@ -1636,7 +1813,7 @@ def main():
             f"Envie /ajuda para ver os comandos."
         )
 
-    # FIX v12.4: preserva comandos recentes (<120s) em vez de descartar tudo
+    # FIX v12.5: preserva comandos recentes (<120s) em vez de descartar tudo
     ultimo_offset = None
     try:
         r = requests.get(
@@ -1670,7 +1847,7 @@ def main():
     with _estado_lock:
         _estado["ultimo_offset"] = ultimo_offset
 
-    # FIX v12.4: monitoramento em thread separada — não bloqueia comandos
+    # FIX v12.5: monitoramento em thread separada — não bloqueia comandos
     monitor_thread = threading.Thread(target=loop_monitor_trades, daemon=True)
     monitor_thread.start()
 
