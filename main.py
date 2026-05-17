@@ -354,116 +354,21 @@ def parse_candle(c):
 
 
 # ============================================================
-# SCANNER METODOLOGIA AGREGADO v12.5
-# Top-Down 1H -> 15M | Tuk Tuk | VWAP Ancorado | Sem RSI
+# SCANNER METODOLOGIA AGREGADO v12.7
+# Wyckoff CORRETO: Lateralizacao + Compressao + Vol Crescente
+# O Tuk Tuk e a COMPRESSAO dentro do range, nao o rompimento.
 # ============================================================
 
 def calcular_vwap_ancorado(candles):
-    """VWAP ancorado no inicio da serie de candles fornecida."""
-    num = 0.0
-    den = 0.0
+    num, den = 0.0, 0.0
     for c in candles:
-        tp = (c["h"] + c["l"] + c["c"]) / 3
+        tp   = (c["h"] + c["l"] + c["c"]) / 3
         num += tp * c["v"]
         den += c["v"]
     return num / den if den > 0 else 0
 
-def detectar_bias_1h(candles_1h):
-    """
-    Detecta bias estrutural no 1H por sequencia de HH/HL ou LH/LL.
-    Retorna: "LONG", "SHORT" ou "NEUTRO"
-    """
-    if len(candles_1h) < 10:
-        return "NEUTRO"
-    highs  = [c["h"] for c in candles_1h]
-    lows   = [c["l"] for c in candles_1h]
-    closes = [c["c"] for c in candles_1h]
-
-    # Swing highs e lows simples (janela de 3)
-    swing_highs = []
-    swing_lows  = []
-    for i in range(1, len(highs) - 1):
-        if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
-            swing_highs.append(highs[i])
-        if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
-            swing_lows.append(lows[i])
-
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-        hh = swing_highs[-1] > swing_highs[-2]  # Higher High
-        hl = swing_lows[-1]  > swing_lows[-2]   # Higher Low
-        lh = swing_highs[-1] < swing_highs[-2]  # Lower High
-        ll = swing_lows[-1]  < swing_lows[-2]   # Lower Low
-        if hh and hl:
-            return "LONG"
-        if lh and ll:
-            return "SHORT"
-    return "NEUTRO"
-
-def detectar_tuk_tuk(candles_15m, atr_medio):
-    """
-    Detecta padrao Tuk Tuk de Wyckoff no 15M.
-    Definicao: candles de baixa amplitude + volume crescente dentro de range
-               -> vela de grande amplitude + alto volume no rompimento.
-    Retorna: "LONG", "SHORT" ou None
-    """
-    if len(candles_15m) < 10 or atr_medio <= 0:
-        return None
-
-    LOOKBACK     = 5    # barras de compressao
-    FATOR_COMP   = 0.75 # amplitude < 0.75x ATR = comprimido
-    FATOR_EXP    = 1.8  # amplitude > 1.8x ATR = grande
-    FATOR_FLAT   = 3.5  # range da janela < 3.5x ATR = lateralizacao
-    VOL_ZSCORE   = 1.8  # volume da barra atual vs media
-
-    # Barra atual (rompimento)
-    atual = candles_15m[-1]
-    amp_atual = atual["h"] - atual["l"]
-
-    # Fase 1: verificar compressao nas N barras anteriores
-    janela = candles_15m[-(LOOKBACK+1):-1]  # 5 barras antes da atual
-    if len(janela) < LOOKBACK:
-        return None
-
-    # Amplitude baixa em todas as barras
-    amps = [c["h"] - c["l"] for c in janela]
-    comp_ok = all(a < atr_medio * FATOR_COMP for a in amps)
-    if not comp_ok:
-        return None
-
-    # Volume crescente (maioria dos pares consecutivos)
-    vols = [c["v"] for c in janela]
-    pares_crescentes = sum(1 for i in range(1, len(vols)) if vols[i] > vols[i-1])
-    vol_cresc_ok = pares_crescentes >= max(1, LOOKBACK - 2)
-    if not vol_cresc_ok:
-        return None
-
-    # Range da janela flat (lateralizacao real)
-    rh = max(c["h"] for c in janela)
-    rl = min(c["l"] for c in janela)
-    if (rh - rl) >= FATOR_FLAT * atr_medio:
-        return None
-
-    # Fase 2: barra atual com grande amplitude e alto volume
-    if amp_atual <= atr_medio * FATOR_EXP:
-        return None
-
-    vols_hist = [c["v"] for c in candles_15m[:-1]]
-    mean_vol  = sum(vols_hist) / len(vols_hist) if vols_hist else 0
-    std_vol   = (sum((v - mean_vol)**2 for v in vols_hist) / len(vols_hist))**0.5 if vols_hist else 0
-    zscore    = (atual["v"] - mean_vol) / std_vol if std_vol > 0 else 0
-    if zscore < VOL_ZSCORE:
-        return None
-
-    # Direcao do breakout
-    if atual["c"] > rh and atual["c"] >= atual["o"]:  # fecha acima do range = LONG
-        return "LONG"
-    if atual["c"] < rl and atual["c"] <= atual["o"]:  # fecha abaixo do range = SHORT
-        return "SHORT"
-    return None
-
 def calcular_atr(candles, periodo=14):
-    """ATR medio simples."""
-    if len(candles) < periodo:
+    if len(candles) < periodo + 1:
         return 0
     trs = []
     for i in range(1, len(candles)):
@@ -473,93 +378,351 @@ def calcular_atr(candles, periodo=14):
         trs.append(max(hl, hc, lc))
     return sum(trs[-periodo:]) / periodo if trs else 0
 
+def detectar_lateralizacao(candles, atr):
+    """
+    Detecta se o mercado esta em lateralizacao real.
+    Usa as ultimas N barras e verifica:
+    - Range (max high - min low) < FATOR x ATR  => mercado comprimido
+    - Preco oscilando entre suporte e resistencia sem tendencia clara
+    Retorna: (range_high, range_low, True/False)
+    """
+    N = 40  # janela de lateralizacao (40 barras 1H = ~2 dias)
+    if len(candles) < N or atr <= 0:
+        return 0, 0, False
+
+    janela = candles[-N:]
+    rh = max(c["h"] for c in janela)
+    rl = min(c["l"] for c in janela)
+    largura = rh - rl
+
+    # Lateralizacao: largura < 5x ATR
+    # Para EDEN (exemplo): ATR 1H ~0.003, range ~0.015 = 5x => lateral
+    FATOR_LATERAL = 5.0
+    if largura >= atr * FATOR_LATERAL:
+        return rh, rl, False
+
+    # Confirmar que preco nao esta em tendencia forte
+    # Verificar se os ultimos closes estao dentro do range (nao rompendo)
+    closes = [c["c"] for c in janela[-10:]]
+    meio   = (rh + rl) / 2
+    acima  = sum(1 for c in closes if c > meio)
+    abaixo = sum(1 for c in closes if c <= meio)
+
+    # Se tudo no mesmo lado = tendencia, nao lateral
+    if acima == len(closes) or abaixo == len(closes):
+        return rh, rl, False
+
+    return rh, rl, True
+
+def detectar_spring_upthrust(candles, range_high, range_low, atr):
+    """
+    Detecta Spring ou Upthrust nas ultimas 10 barras dentro do range.
+    Spring: barra que penetra abaixo do range_low e fecha acima = acumulacao
+    Upthrust: barra que penetra acima do range_high e fecha abaixo = distribuicao
+    Retorna: "SPRING", "UPTHRUST" ou None
+    """
+    if not candles or atr <= 0:
+        return None
+
+    for c in reversed(candles[-10:]):
+        # Spring
+        if c["l"] < range_low and c["c"] > range_low and c["c"] >= c["o"]:
+            return "SPRING"
+        # Upthrust
+        if c["h"] > range_high and c["c"] < range_high and c["c"] <= c["o"]:
+            return "UPTHRUST"
+    return None
+
+def detectar_tuk_tuk_wyckoff(candles, atr, range_high, range_low):
+    """
+    DEFINICAO CORRETA DO TUK TUK (Wyckoff):
+    Sequencia de velas de BAIXA AMPLITUDE com VOLUME CRESCENTE
+    DENTRO de uma lateralizacao. O segredo esta no aumento de volume
+    relativo entre as velas — nao na amplitude do rompimento.
+
+    Detecta nas ultimas barras dentro do range:
+    - Pelo menos 3 velas consecutivas de baixa amplitude (< 0.6x ATR)
+    - Volume de cada vela MAIOR que a anterior (crescente)
+    - Todas as velas dentro do range (nao romperam ainda)
+
+    Retorna: "LONG" (acima do meio do range), "SHORT" (abaixo), ou None
+    """
+    if len(candles) < 6 or atr <= 0:
+        return None
+
+    FATOR_COMP  = 0.70   # vela pequena = amplitude < 0.70x ATR
+    MIN_VELAS   = 3      # minimo de velas comprimidas consecutivas
+    JANELA_BUSCA = 15    # quantas barras recentes verificar
+
+    meio_range = (range_high + range_low) / 2
+    janela = candles[-JANELA_BUSCA:]
+
+    # Percorre a janela procurando sequencias validas
+    melhor_seq = 0
+    melhor_dir = None
+
+    i = 0
+    while i < len(janela):
+        c = janela[i]
+        amp = c["h"] - c["l"]
+
+        # Inicio de possivel sequencia: vela pequena dentro do range
+        if amp < atr * FATOR_COMP and rl_in_range(c, range_high, range_low):
+            seq      = [c]
+            j        = i + 1
+            vol_ok   = True
+
+            while j < len(janela):
+                prox = janela[j]
+                amp_prox = prox["h"] - prox["l"]
+
+                # Proximo candle deve: amplitude pequena + volume maior + dentro do range
+                if (amp_prox < atr * FATOR_COMP
+                        and prox["v"] >= seq[-1]["v"]   # volume crescente ou igual
+                        and rl_in_range(prox, range_high, range_low)):
+                    seq.append(prox)
+                    j += 1
+                else:
+                    break
+
+            if len(seq) >= MIN_VELAS:
+                # Verificar se volume e genuinamente crescente (nao apenas estavel)
+                vols = [c["v"] for c in seq]
+                crescentes = sum(1 for k in range(1, len(vols)) if vols[k] > vols[k-1])
+                if crescentes >= len(vols) - 1:  # maioria crescente
+                    if len(seq) > melhor_seq:
+                        melhor_seq = len(seq)
+                        # Direcao baseada na posicao no range
+                        ultimo_close = seq[-1]["c"]
+                        if ultimo_close >= meio_range:
+                            melhor_dir = "LONG"   # compressao na metade superior = rompimento para cima
+                        else:
+                            melhor_dir = "SHORT"  # compressao na metade inferior = rompimento para baixo
+            i = j
+        else:
+            i += 1
+
+    if melhor_seq >= MIN_VELAS:
+        return melhor_dir
+    return None
+
+def rl_in_range(candle, rh, rl):
+    """Verifica se o corpo da vela esta dentro do range."""
+    body_h = max(candle["o"], candle["c"])
+    body_l = min(candle["o"], candle["c"])
+    return body_h <= rh * 1.005 and body_l >= rl * 0.995
+
+def normalizar_symbol_coinalyze_early(symbol):
+    s = symbol.upper().split("@")[0]
+    for suf in ["_PERP.A", "_PERP.0", "_PERP.6", ".P", "-PERP"]:
+        s = s.replace(suf, "")
+    s = s.replace("-","").replace("_","").replace("/","")
+    if not s.endswith("USDT") and not s.endswith("USDC"):
+        s = s + "USDT"
+    return f"{s}_PERP.A"
+
+def buscar_funding_rapido(symbol):
+    try:
+        sym_cg  = normalizar_symbol_coinalyze_early(symbol)
+        headers = {"api_key": COINALYZE_KEY}
+        r = requests.get(
+            f"{COINALYZE_BASE}/funding-rate",
+            params={"symbols": sym_cg},
+            headers=headers, timeout=5
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                return round(float(data[0].get("value", 0)) * 100, 4)
+    except:
+        pass
+    return None
+
 def analisar_ativo_agregado(symbol):
     """
-    Analise completa com metodologia Agregado.
-    Top-Down 1H -> 15M | Tuk Tuk | VWAP Ancorado.
-    Retorna dict com resultado ou None se nao passou.
+    Scanner Wyckoff v12.7 — logica correta:
+    1. Detectar lateralizacao no 1H
+    2. Identificar Spring ou Upthrust dentro do range
+    3. Identificar Tuk Tuk: velas pequenas com volume crescente dentro do range
+    4. Funding < 1% absoluto
+    5. Alertar para iminencia de rompimento
     """
-    # ── 1H: contexto e bias estrutural ──────────────────────
-    candles_1h_raw = buscar_candles(symbol, "hour1", 60)
+    # ── 1H: lateralizacao ───────────────────────────────────
+    candles_1h_raw = buscar_candles(symbol, "hour1", 80)
     if not candles_1h_raw:
         return None
     candles_1h = [parse_candle(c) for c in candles_1h_raw]
     candles_1h = [c for c in candles_1h if c]
-    if len(candles_1h) < 20:
+    if len(candles_1h) < 40:
         return None
 
-    bias_1h = detectar_bias_1h(candles_1h)
-    if bias_1h == "NEUTRO":
-        return None  # sem bias definido = sem edge
-
-    # ── 15M: filtro de volume e Tuk Tuk ─────────────────────
-    candles_15m_raw = buscar_candles(symbol, "minute15", 60)
-    if not candles_15m_raw:
-        return None
-    candles_15m = [parse_candle(c) for c in candles_15m_raw]
-    candles_15m = [c for c in candles_15m if c]
-    if len(candles_15m) < 20:
+    atr_1h = calcular_atr(candles_1h, 14)
+    if atr_1h <= 0:
         return None
 
-    # Volume relativo no 15M
-    vols_15m = [c["v"] for c in candles_15m]
-    vol_rel  = volume_relativo(vols_15m)
-    if vol_rel < 5.0:
-        return None
+    range_high, range_low, is_lateral = detectar_lateralizacao(candles_1h, atr_1h)
+    if not is_lateral:
+        return None  # sem lateralizacao = sem Wyckoff
 
-    # ATR do 15M
-    atr_15m = calcular_atr(candles_15m, 14)
-    if atr_15m <= 0:
-        return None
+    # ── Spring ou Upthrust dentro do range ──────────────────
+    sinal_wyckoff = detectar_spring_upthrust(candles_1h, range_high, range_low, atr_1h)
+    # Spring ou Upthrust sao opcionais — aumentam o score mas nao bloqueiam
 
-    # Tuk Tuk obrigatorio
-    tuk_dir = detectar_tuk_tuk(candles_15m, atr_15m)
+    # ── Tuk Tuk: compressao + volume crescente no range ─────
+    tuk_dir = detectar_tuk_tuk_wyckoff(candles_1h, atr_1h, range_high, range_low)
     if tuk_dir is None:
+        return None  # sem Tuk Tuk = sem sinal
+
+    # ── Funding Rate < 1% absoluto ──────────────────────────
+    funding = buscar_funding_rapido(symbol)
+    if funding is not None and abs(funding) >= 1.0:
         return None
 
-    # Tuk Tuk deve estar alinhado com o bias do 1H
-    if tuk_dir != bias_1h:
-        return None
+    # ── Preco atual ─────────────────────────────────────────
+    preco = candles_1h[-1]["c"]
 
-    # ── VWAP ancorado no inicio do movimento 1H ─────────────
-    # Ancora no candle mais baixo (LONG) ou mais alto (SHORT) das ultimas 20 barras 1H
-    if bias_1h == "LONG":
-        idx_ancora = min(range(len(candles_1h[-20:])), key=lambda i: candles_1h[-20:][i]["l"])
-        candles_ancora = candles_1h[-20:][idx_ancora:]
-    else:
-        idx_ancora = max(range(len(candles_1h[-20:])), key=lambda i: candles_1h[-20:][i]["h"])
-        candles_ancora = candles_1h[-20:][idx_ancora:]
-
-    vwap_ancorado = calcular_vwap_ancorado(candles_ancora) if len(candles_ancora) >= 2 else 0
-
-    preco = candles_15m[-1]["c"]
-
-    # Para LONG: preco deve estar acima do VWAP ancorado (ou proximo)
-    # Para SHORT: preco deve estar abaixo do VWAP ancorado (ou proximo)
-    if vwap_ancorado > 0:
-        if bias_1h == "LONG"  and preco < vwap_ancorado * 0.98:
-            return None  # preco muito abaixo do VWAP = sem edge long
-        if bias_1h == "SHORT" and preco > vwap_ancorado * 1.02:
-            return None  # preco muito acima do VWAP = sem edge short
+    # ── VWAP ancorado no inicio do range ────────────────────
+    candles_ancora = candles_1h[-40:]
+    vwap_ancorado  = calcular_vwap_ancorado(candles_ancora)
 
     # ── Score de qualidade ───────────────────────────────────
-    score = 0
-    if vol_rel >= 10: score += 40
-    elif vol_rel >= 7: score += 25
-    else:              score += 10
-    score += 40  # Tuk Tuk confirmado = peso alto
-    if vwap_ancorado > 0: score += 20
+    score = 50  # lateralizacao confirmada
+    score += 30  # Tuk Tuk confirmado
+    if sinal_wyckoff == "SPRING"   and tuk_dir == "LONG":  score += 20
+    if sinal_wyckoff == "UPTHRUST" and tuk_dir == "SHORT": score += 20
+    if funding is not None and abs(funding) < 0.05: score += 10
+
+    largura_range = range_high - range_low
+    largura_pct   = round(largura_range / range_low * 100, 1) if range_low > 0 else 0
 
     return {
         "symbol":        symbol.split("@")[0].upper(),
         "preco":         preco,
-        "bias_1h":       bias_1h,
         "tuk_tuk":       tuk_dir,
-        "vol_rel_15m":   round(vol_rel, 1),
+        "wyckoff":       sinal_wyckoff or "-",
+        "range_high":    round(range_high, 6),
+        "range_low":     round(range_low,  6),
+        "largura_pct":   largura_pct,
         "vwap_ancorado": round(vwap_ancorado, 6),
+        "funding":       funding,
         "score":         min(score, 100),
-        "atr_15m":       round(atr_15m, 6),
     }
+
+def rodar_scanner():
+    brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
+    enviar_telegram(
+        f"🔍 <b>SCANNER WYCKOFF v12.7</b>\n"
+        f"{brt}\n"
+        f"Lateralizacao + Tuk Tuk + Spring/UT | Funding &lt;1%\n"
+        f"Analisando ativos..."
+    )
+    tickers   = buscar_ticker_24h()
+    pares_raw = buscar_todos_pares()
+
+    pares = []
+    for p in pares_raw:
+        t = tickers.get(p)
+        if t:
+            vol = extrair_volume(t)
+            if vol == 0 or vol >= MIN_VOLUME_24H:
+                pares.append(p)
+        else:
+            pares.append(p)
+    pares = pares[:600]
+
+    blacklist    = get_blacklist()
+    resultados   = []
+    n_analisados = 0
+
+    for symbol in pares:
+        if symbol.upper() in blacklist:
+            continue
+        try:
+            resultado = analisar_ativo_agregado(symbol)
+            n_analisados += 1
+            if resultado:
+                resultados.append(resultado)
+            time.sleep(0.25)
+        except Exception as e:
+            log.error(f"Scanner {symbol}: {e}")
+
+    resultados.sort(key=lambda x: x["score"], reverse=True)
+
+    if not resultados:
+        enviar_telegram(
+            f"✅ <b>SCAN CONCLUIDO v12.7</b>\n"
+            f"{brt}\n"
+            f"Analisados: {n_analisados} ativos\n"
+            f"Nenhum ativo com Lateralizacao + Tuk Tuk + Funding &lt;1%."
+        )
+        return
+
+    longs  = [r for r in resultados if r["tuk_tuk"] == "LONG"]
+    shorts = [r for r in resultados if r["tuk_tuk"] == "SHORT"]
+
+    linhas = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>SCANNER WYCKOFF v12.7</b>",
+        f"🕐 {brt}",
+        f"✅ {len(resultados)} setups | {n_analisados} analisados",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    def fmt(r, i):
+        wyck_txt = f" | {r['wyckoff']}" if r["wyckoff"] != "-" else ""
+        fund_txt = f" | FR {r['funding']:+.4f}%" if r["funding"] is not None else ""
+        return (
+            f"{i}. <b>{r['symbol']}</b>"
+            f" | Range {r['largura_pct']}%"
+            f" | Score {r['score']}"
+            f" | 💲{r['preco']:.6g}"
+            f"\n   Sup ${r['range_low']:.6g} → Res ${r['range_high']:.6g}"
+            f"{wyck_txt}{fund_txt}"
+        )
+
+    if longs:
+        linhas.append("🟢 <b>LONG — Tuk Tuk ▲ iminente</b>\n")
+        for i, r in enumerate(longs, 1):
+            linhas.append(fmt(r, i))
+            sent     = buscar_sentimento(r["symbol"])
+            sent_txt = formatar_sentimento(sent)
+            if sent_txt:
+                linhas.append(sent_txt)
+            linhas.append("")
+
+    if shorts:
+        linhas.append("🔴 <b>SHORT — Tuk Tuk ▼ iminente</b>\n")
+        for i, r in enumerate(shorts, 1):
+            linhas.append(fmt(r, i))
+            sent     = buscar_sentimento(r["symbol"])
+            sent_txt = formatar_sentimento(sent)
+            if sent_txt:
+                linhas.append(sent_txt)
+            linhas.append("")
+
+    linhas += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "⚠️ Sinal de IMINENCIA — envie grafico para analise completa!"
+    ]
+
+    mensagem = "\n".join(linhas)
+    if len(mensagem) <= 4000:
+        enviar_telegram(mensagem)
+    else:
+        bloco, chars = [], 0
+        for linha in linhas:
+            if chars + len(linha) > 3800:
+                enviar_telegram("\n".join(bloco))
+                bloco, chars = [linha], len(linha)
+                time.sleep(1)
+            else:
+                bloco.append(linha)
+                chars += len(linha)
+        if bloco:
+            enviar_telegram("\n".join(bloco))
+
+    log.info(f"Scanner v12.7: {len(resultados)} setups de {n_analisados} ativos.")
 
 def normalizar_symbol_coinalyze(symbol):
     s = symbol.upper().strip()
@@ -706,7 +869,7 @@ def remover_blacklist(ativo):
 def rodar_scanner():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     enviar_telegram(
-        f"🔍 <b>SCANNER AGREGADO v12.5</b>\n"
+        f"🔍 <b>SCANNER AGREGADO v12.6</b>\n"
         f"{brt}\n"
         f"Top-Down 1H→15M | Tuk Tuk | VWAP Ancorado\n"
         f"Analisando ativos..."
@@ -1379,7 +1542,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v12.5"})
+    return jsonify({"status": "online", "version": "v12.7"})
 
 @flask_app.route("/")
 @flask_app.route("/dashboard")
@@ -1499,7 +1662,7 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.5 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.7 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1774,7 +1937,7 @@ def processar_comando(texto):
         n_abertos = c_st.fetchone()[0]
         conn_st.close()
         return (
-            f"✅ <b>LucSharkTrade v12.5 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.7 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
@@ -1929,7 +2092,7 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.5 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.7 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
             f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
             f"✅ FIX: monitoramento em thread dedicada\n"
