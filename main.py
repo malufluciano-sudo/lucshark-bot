@@ -1059,31 +1059,19 @@ def buscar_preco_atual(ativo):
                 except:
                     continue
 
-    # 2. Pega high/low do candle atual (5m) — precisão intracandle real
-    sym_lbank = symbol.lower().replace("/", "_")
-    candles   = buscar_candles(sym_lbank, "minute5", 3)
-    high_real = None
-    low_real  = None
-    if candles:
-        parsed = [parse_candle(c) for c in candles]
-        parsed = [p for p in parsed if p is not None]
-        if parsed:
-            ultimo    = parsed[-1]
-            high_real = ultimo["h"]
-            low_real  = ultimo["l"]
-            if last is None:
-                last = ultimo["c"]
-                bid  = last
-                ask  = last
-
+    # v12.8 CORREÇÃO DEFINITIVA:
+    # NÃO buscar candles LBank para high/low — ativos de outras exchanges
+    # (BingX, Binance) retornam candles de símbolos errados na LBank,
+    # causando acionamentos falsos de stop e alertas.
+    # O "last" do ticker ccxt é o único valor confiável para qualquer exchange.
+    # Stops e alertas usam SOMENTE o last para comparação.
     if last is None:
         return None
 
-    # High/low = candle atual; se falhou, usa o last como fallback seguro
     return {
         "preco": last,
-        "high":  high_real if high_real is not None else last,
-        "low":   low_real  if low_real  is not None else last,
+        "high":  last,
+        "low":   last,
         "bid":   bid  or last,
         "ask":   ask  or last,
     }
@@ -1291,7 +1279,7 @@ def monitorar_trades():
                 continue
             # Alvos: só acionar se entrada já foi confirmada
             if alerta_ja_enviado(f"{base}_entrada"):
-                if high >= a3 and not alerta_ja_enviado(f"{base}_a3"):
+                if preco >= a3 and not alerta_ja_enviado(f"{base}_a3"):
                     marcar_alerta(f"{base}_a3")
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
@@ -1305,7 +1293,7 @@ def monitorar_trades():
                         f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
                         f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
                     )
-                elif high >= a2 and not alerta_ja_enviado(f"{base}_a2"):
+                elif preco >= a2 and not alerta_ja_enviado(f"{base}_a2"):
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A2")
@@ -1314,7 +1302,7 @@ def monitorar_trades():
                         f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
                         f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
                     )
-                elif high >= a1 and not alerta_ja_enviado(f"{base}_a1"):
+                elif preco >= a1 and not alerta_ja_enviado(f"{base}_a1"):
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A1")
                     enviar_telegram(
@@ -1327,26 +1315,24 @@ def monitorar_trades():
             # Entrada: acionar SOMENTE se high/low intracandle cruzam o nível
             # NUNCA usar abs(preco - entrada) — isso causava falso acionamento
             if not alerta_ja_enviado(f"{base}_entrada"):
-                if low <= entrada <= high:
-                    # Confirmação: preco atual deve estar próximo da entrada (não divergido)
-                    if abs(preco - entrada) <= entrada * 0.015:
-                        marcar_alerta(f"{base}_entrada")
-                        marcar_alerta(f"{base}_zona")
-                        enviar_telegram(
-                            f"🟢 <b>ENTRADA LONG ACIONADA — {ativo} #{tid}</b>\n"
-                            f"💲 Preço: ${preco:.6g}\n"
-                            f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
-                            f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
-                        )
-                elif preco < entrada:
-                    distancia_pct = (entrada - preco) / entrada * 100
+                if preco <= entrada:
+                    marcar_alerta(f"{base}_entrada")
+                    marcar_alerta(f"{base}_zona")
+                    enviar_telegram(
+                        f"🟢 <b>ENTRADA LONG ACIONADA — {ativo} #{tid}</b>\n"
+                        f"💲 Preço: ${preco:.6g}\n"
+                        f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                        f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
+                    )
+                elif preco > entrada:
+                    distancia_pct = (preco - entrada) / entrada * 100
                     if distancia_pct <= 3.0 and not alerta_ja_enviado(f"{base}_zona"):
                         marcar_alerta(f"{base}_zona")
                         enviar_telegram(
                             f"👀 <b>ZONA DE ENTRADA — {ativo} LONG #{tid}</b>\n"
                             f"💲 Preço: ${preco:.6g} | Entrada: ${entrada}\n"
-                            f"📍 Preço a {round(distancia_pct,2)}% abaixo da entrada\n"
-                            f"⏳ Aguardando subida para acionar..."
+                            f"📍 Preço a {round(distancia_pct,2)}% acima da entrada\n"
+                            f"⏳ Aguardando queda para acionar..."
                         )
 
         elif direcao == "SHORT":
@@ -1366,7 +1352,7 @@ def monitorar_trades():
                 continue
             # Alvos: só acionar se entrada já foi confirmada
             if alerta_ja_enviado(f"{base}_entrada"):
-                if low <= a3 and not alerta_ja_enviado(f"{base}_a3"):
+                if preco <= a3 and not alerta_ja_enviado(f"{base}_a3"):
                     marcar_alerta(f"{base}_a3")
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
@@ -1380,7 +1366,7 @@ def monitorar_trades():
                         f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
                         f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
                     )
-                elif low <= a2 and not alerta_ja_enviado(f"{base}_a2"):
+                elif preco <= a2 and not alerta_ja_enviado(f"{base}_a2"):
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A2")
@@ -1389,7 +1375,7 @@ def monitorar_trades():
                         f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
                         f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
                     )
-                elif low <= a1 and not alerta_ja_enviado(f"{base}_a1"):
+                elif preco <= a1 and not alerta_ja_enviado(f"{base}_a1"):
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A1")
                     enviar_telegram(
@@ -1399,27 +1385,25 @@ def monitorar_trades():
                         f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                         f"⏳ Aguardar A2: ${a2}"
                     )
-            # Entrada: acionar SOMENTE se high/low intracandle cruzam o nível
             if not alerta_ja_enviado(f"{base}_entrada"):
-                if low <= entrada <= high:
-                    if abs(preco - entrada) <= entrada * 0.015:
-                        marcar_alerta(f"{base}_entrada")
-                        marcar_alerta(f"{base}_zona")
-                        enviar_telegram(
-                            f"🔴 <b>ENTRADA SHORT ACIONADA — {ativo} #{tid}</b>\n"
-                            f"💲 Preço: ${preco:.6g}\n"
-                            f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
-                            f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
-                        )
-                elif preco > entrada:
-                    distancia_pct = (preco - entrada) / entrada * 100
+                if preco >= entrada:
+                    marcar_alerta(f"{base}_entrada")
+                    marcar_alerta(f"{base}_zona")
+                    enviar_telegram(
+                        f"🔴 <b>ENTRADA SHORT ACIONADA — {ativo} #{tid}</b>\n"
+                        f"💲 Preço: ${preco:.6g}\n"
+                        f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                        f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
+                    )
+                elif preco < entrada:
+                    distancia_pct = (entrada - preco) / entrada * 100
                     if distancia_pct <= 3.0 and not alerta_ja_enviado(f"{base}_zona"):
                         marcar_alerta(f"{base}_zona")
                         enviar_telegram(
                             f"👀 <b>ZONA DE ENTRADA — {ativo} SHORT #{tid}</b>\n"
                             f"💲 Preço: ${preco:.6g} | Entrada: ${entrada}\n"
-                            f"📍 Preço a {round(distancia_pct,2)}% acima da entrada\n"
-                            f"⏳ Aguardando queda para acionar..."
+                            f"📍 Preço a {round(distancia_pct,2)}% abaixo da entrada\n"
+                            f"⏳ Aguardando subida para acionar..."
                         )
 
 def relatorio_diario():
