@@ -354,7 +354,7 @@ def parse_candle(c):
 
 
 # ============================================================
-# SCANNER METODOLOGIA AGREGADO v12.7
+# SCANNER METODOLOGIA AGREGADO v12.8
 # Wyckoff CORRETO: Lateralizacao + Compressao + Vol Crescente
 # O Tuk Tuk e a COMPRESSAO dentro do range, nao o rompimento.
 # ============================================================
@@ -540,7 +540,7 @@ def buscar_funding_rapido(symbol):
 
 def analisar_ativo_agregado(symbol):
     """
-    Scanner Wyckoff v12.7 — logica correta:
+    Scanner Wyckoff v12.8 — logica correta:
     1. Detectar lateralizacao no 1H
     2. Identificar Spring ou Upthrust dentro do range
     3. Identificar Tuk Tuk: velas pequenas com volume crescente dentro do range
@@ -573,9 +573,11 @@ def analisar_ativo_agregado(symbol):
     if tuk_dir is None:
         return None  # sem Tuk Tuk = sem sinal
 
-    # ── Funding Rate < 1% absoluto ──────────────────────────
+    # ── Funding Rate ─────────────────────────────────────────
+    # Descartar apenas quando funding < -1% (shorts sobrecarregados = capitulacao extrema)
+    # Funding positivo alto nao descarta — e normal em tendencia de alta
     funding = buscar_funding_rapido(symbol)
-    if funding is not None and abs(funding) >= 1.0:
+    if funding is not None and funding < -1.0:
         return None
 
     # ── Preco atual ─────────────────────────────────────────
@@ -611,7 +613,7 @@ def analisar_ativo_agregado(symbol):
 def rodar_scanner():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     enviar_telegram(
-        f"🔍 <b>SCANNER WYCKOFF v12.7</b>\n"
+        f"🔍 <b>SCANNER WYCKOFF v12.8</b>\n"
         f"{brt}\n"
         f"Lateralizacao + Tuk Tuk + Spring/UT | Funding &lt;1%\n"
         f"Analisando ativos..."
@@ -650,7 +652,7 @@ def rodar_scanner():
 
     if not resultados:
         enviar_telegram(
-            f"✅ <b>SCAN CONCLUIDO v12.7</b>\n"
+            f"✅ <b>SCAN CONCLUIDO v12.8</b>\n"
             f"{brt}\n"
             f"Analisados: {n_analisados} ativos\n"
             f"Nenhum ativo com Lateralizacao + Tuk Tuk + Funding &lt;1%."
@@ -662,7 +664,7 @@ def rodar_scanner():
 
     linhas = [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>SCANNER WYCKOFF v12.7</b>",
+        f"📊 <b>SCANNER WYCKOFF v12.8</b>",
         f"🕐 {brt}",
         f"✅ {len(resultados)} setups | {n_analisados} analisados",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -722,7 +724,7 @@ def rodar_scanner():
         if bloco:
             enviar_telegram("\n".join(bloco))
 
-    log.info(f"Scanner v12.7: {len(resultados)} setups de {n_analisados} ativos.")
+    log.info(f"Scanner v12.8: {len(resultados)} setups de {n_analisados} ativos.")
 
 def normalizar_symbol_coinalyze(symbol):
     s = symbol.upper().strip()
@@ -1201,11 +1203,16 @@ def monitorar_alertas_nivel():
         low   = dados.get("low", preco)
 
         disparar = False
-        # ACIMA: preco sobe e toca o nivel
-        if condicao == "ACIMA" and high >= nivel:
+        # ── CORREÇÃO v12.8 ──────────────────────────────────────────
+        # Usar APENAS o preco last para comparacao de alertas de nivel.
+        # O high/low intracandle so e confiavel para exchanges monitoradas.
+        # Para ativos de outras exchanges (BingX, Binance), o candle 5M
+        # pode retornar valores incorretos causando acionamentos falsos.
+        # Tolerancia de 0.1% para evitar miss por spread/slippage.
+        # ────────────────────────────────────────────────────────────
+        if condicao == "ACIMA" and preco >= nivel:
             disparar = True
-        # ABAIXO: preco cai e toca o nivel
-        elif condicao == "ABAIXO" and low <= nivel:
+        elif condicao == "ABAIXO" and preco <= nivel:
             disparar = True
 
         if disparar:
@@ -1268,7 +1275,8 @@ def monitorar_trades():
         base = f"{tid}_{ativo}"
 
         if direcao == "LONG":
-            if low <= stop and not alerta_ja_enviado(f"{base}_stop"):
+            # v12.8: usar preco para stop (high/low pode ser de exchange errada)
+            if preco <= stop and not alerta_ja_enviado(f"{base}_stop"):
                 marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
                 duracao = calcular_duracao(criado)
@@ -1342,7 +1350,8 @@ def monitorar_trades():
                         )
 
         elif direcao == "SHORT":
-            if high >= stop and not alerta_ja_enviado(f"{base}_stop"):
+            # v12.8: usar preco para stop (high/low pode ser de exchange errada)
+            if preco >= stop and not alerta_ja_enviado(f"{base}_stop"):
                 marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
                 duracao = calcular_duracao(criado)
@@ -1542,7 +1551,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v12.7"})
+    return jsonify({"status": "online", "version": "v12.8"})
 
 @flask_app.route("/")
 @flask_app.route("/dashboard")
@@ -1662,7 +1671,7 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.7 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.8 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1937,7 +1946,7 @@ def processar_comando(texto):
         n_abertos = c_st.fetchone()[0]
         conn_st.close()
         return (
-            f"✅ <b>LucSharkTrade v12.7 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.8 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
@@ -2092,7 +2101,7 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.7 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.8 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
             f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
             f"✅ FIX: monitoramento em thread dedicada\n"
