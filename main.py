@@ -1107,7 +1107,27 @@ def calcular_duracao(criado_em):
         return "—"
 
 
+# Dicionario global para guardar preco anterior de cada trade
+# Permite detectar cruzamento de nivel mesmo que o ciclo pule sobre ele
+_preco_anterior = {}
+
+def nivel_cruzado(preco_ant, preco_atual, nivel, direcao):
+    """
+    Detecta se o nivel foi cruzado entre duas leituras de preco.
+    Garante que o alerta dispara mesmo que o bot nao capture o momento exato.
+    direcao ABAIXO: preco caiu atraves do nivel (entrada LONG, stop LONG, alvos SHORT)
+    direcao ACIMA:  preco subiu atraves do nivel (entrada SHORT, stop SHORT, alvos LONG)
+    """
+    if preco_ant is None:
+        # Primeira leitura: comparar apenas com preco atual
+        return preco_atual <= nivel if direcao == "ABAIXO" else preco_atual >= nivel
+    if direcao == "ABAIXO":
+        return preco_ant > nivel >= preco_atual
+    else:
+        return preco_ant < nivel <= preco_atual
+
 def monitorar_trades():
+    global _preco_anterior
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
     c.execute("SELECT * FROM trades WHERE resultado='ABERTO'")
@@ -1119,23 +1139,11 @@ def monitorar_trades():
     for trade in abertos:
         tid, ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, resultado, criado = trade
 
-        # ── CORREÇÃO CRÍTICA v12.5 — FILTRO TEMPORAL ───────────────────────
-        # Um trade PENDING só deve ser monitorado APÓS o momento do cadastro.
-        # Isso evita que o bot ative entradas usando dados de preço anteriores
-        # ao cadastro (ex: LINK cadastrado às 13:57 com entrada $10.00 —
-        # o alto do dia havia sido $10.87 muito antes, mas o bot disparava
-        # o acionamento usando o high 24h do ticker).
-        #
-        # Regra: se o trade foi cadastrado há menos de 2 minutos, pular.
-        # Isso dá tempo para o ciclo de monitoramento se estabilizar.
-        # ────────────────────────────────────────────────────────────────────
+        # Filtro temporal: ignorar nos primeiros 120s apos cadastro
         try:
-            fmt_criado  = "%Y-%m-%d %H:%M"
-            dt_criado   = datetime.strptime(criado, fmt_criado)
-            dt_criado   = dt_criado.replace(tzinfo=timezone(timedelta(hours=OFFSET_BRT)))
-            segundos_desde_cadastro = (agora_brt - dt_criado).total_seconds()
-            if segundos_desde_cadastro < 120:
-                log.info(f"Trade #{tid} {ativo} ignorado — cadastrado há {int(segundos_desde_cadastro)}s (aguardando 120s)")
+            dt_criado = datetime.strptime(criado, "%Y-%m-%d %H:%M")
+            dt_criado = dt_criado.replace(tzinfo=timezone(timedelta(hours=OFFSET_BRT)))
+            if (agora_brt - dt_criado).total_seconds() < 120:
                 continue
         except Exception as e:
             log.warning(f"Filtro temporal trade #{tid}: {e}")
@@ -1145,30 +1153,32 @@ def monitorar_trades():
             log.warning(f"Sem preco para {ativo}")
             continue
 
-        preco = dados["preco"]
-        high  = dados.get("high", preco)
-        low   = dados.get("low", preco)
-
-        base = f"{tid}_{ativo}"
+        preco     = dados["preco"]
+        base      = f"{tid}_{ativo}"
+        chave_ant = f"ant_{tid}_{ativo}"
+        preco_ant = _preco_anterior.get(chave_ant)
 
         if direcao == "LONG":
-            # v12.8: usar preco para stop (high/low pode ser de exchange errada)
-            if preco <= stop and not alerta_ja_enviado(f"{base}_stop"):
+
+            # STOP: preco cruzou para baixo o nivel do stop
+            if nivel_cruzado(preco_ant, preco, stop, "ABAIXO") and not alerta_ja_enviado(f"{base}_stop"):
                 marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
                 duracao = calcular_duracao(criado)
                 enviar_telegram(
-                    f"🛑 <b>STOP — {ativo} LONG #{tid}</b>\n"
+                    f"🛑 <b>STOP ATINGIDO — {ativo} LONG #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
                     f"❌ Sair imediatamente!\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
                     f"📋 Entrada: ${entrada} | Saída: ${preco:.6g}\n"
                     f"❌ LOSS | ⏱ {duracao}"
                 )
+                _preco_anterior[chave_ant] = preco
                 continue
-            # Alvos: só acionar se entrada já foi confirmada
+
+            # ALVOS: so verificar apos entrada confirmada
             if alerta_ja_enviado(f"{base}_entrada"):
-                if preco >= a3 and not alerta_ja_enviado(f"{base}_a3"):
+                if nivel_cruzado(preco_ant, preco, a3, "ACIMA") and not alerta_ja_enviado(f"{base}_a3"):
                     marcar_alerta(f"{base}_a3")
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
@@ -1182,7 +1192,7 @@ def monitorar_trades():
                         f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
                         f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
                     )
-                elif preco >= a2 and not alerta_ja_enviado(f"{base}_a2"):
+                elif nivel_cruzado(preco_ant, preco, a2, "ACIMA") and not alerta_ja_enviado(f"{base}_a2"):
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A2")
@@ -1191,7 +1201,7 @@ def monitorar_trades():
                         f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
                         f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
                     )
-                elif preco >= a1 and not alerta_ja_enviado(f"{base}_a1"):
+                elif nivel_cruzado(preco_ant, preco, a1, "ACIMA") and not alerta_ja_enviado(f"{base}_a1"):
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A1")
                     enviar_telegram(
@@ -1201,47 +1211,39 @@ def monitorar_trades():
                         f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                         f"⏳ Aguardar A2: ${a2}"
                     )
-            # Entrada: acionar SOMENTE se high/low intracandle cruzam o nível
-            # NUNCA usar abs(preco - entrada) — isso causava falso acionamento
+
+            # ENTRADA: preco cruzou para baixo o nivel de entrada
             if not alerta_ja_enviado(f"{base}_entrada"):
-                if preco <= entrada:
+                if nivel_cruzado(preco_ant, preco, entrada, "ABAIXO"):
                     marcar_alerta(f"{base}_entrada")
-                    marcar_alerta(f"{base}_zona")
                     enviar_telegram(
                         f"🟢 <b>ENTRADA LONG ACIONADA — {ativo} #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g}\n"
-                        f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                        f"💲 Preço: ${preco:.6g} | Nível: ${entrada}\n"
+                        f"📥 Stop: ${stop}\n"
                         f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
                     )
-                elif preco > entrada:
-                    distancia_pct = (preco - entrada) / entrada * 100
-                    if distancia_pct <= 3.0 and not alerta_ja_enviado(f"{base}_zona"):
-                        marcar_alerta(f"{base}_zona")
-                        enviar_telegram(
-                            f"👀 <b>ZONA DE ENTRADA — {ativo} LONG #{tid}</b>\n"
-                            f"💲 Preço: ${preco:.6g} | Entrada: ${entrada}\n"
-                            f"📍 Preço a {round(distancia_pct,2)}% acima da entrada\n"
-                            f"⏳ Aguardando queda para acionar..."
-                        )
 
         elif direcao == "SHORT":
-            # v12.8: usar preco para stop (high/low pode ser de exchange errada)
-            if preco >= stop and not alerta_ja_enviado(f"{base}_stop"):
+
+            # STOP: preco cruzou para cima o nivel do stop
+            if nivel_cruzado(preco_ant, preco, stop, "ACIMA") and not alerta_ja_enviado(f"{base}_stop"):
                 marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
                 duracao = calcular_duracao(criado)
                 enviar_telegram(
-                    f"🛑 <b>STOP — {ativo} SHORT #{tid}</b>\n"
+                    f"🛑 <b>STOP ATINGIDO — {ativo} SHORT #{tid}</b>\n"
                     f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
                     f"❌ Sair imediatamente!\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
                     f"📋 Entrada: ${entrada} | Saída: ${preco:.6g}\n"
                     f"❌ LOSS | ⏱ {duracao}"
                 )
+                _preco_anterior[chave_ant] = preco
                 continue
-            # Alvos: só acionar se entrada já foi confirmada
+
+            # ALVOS: so verificar apos entrada confirmada
             if alerta_ja_enviado(f"{base}_entrada"):
-                if preco <= a3 and not alerta_ja_enviado(f"{base}_a3"):
+                if nivel_cruzado(preco_ant, preco, a3, "ABAIXO") and not alerta_ja_enviado(f"{base}_a3"):
                     marcar_alerta(f"{base}_a3")
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
@@ -1255,7 +1257,7 @@ def monitorar_trades():
                         f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
                         f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
                     )
-                elif preco <= a2 and not alerta_ja_enviado(f"{base}_a2"):
+                elif nivel_cruzado(preco_ant, preco, a2, "ABAIXO") and not alerta_ja_enviado(f"{base}_a2"):
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A2")
@@ -1264,7 +1266,7 @@ def monitorar_trades():
                         f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
                         f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
                     )
-                elif preco <= a1 and not alerta_ja_enviado(f"{base}_a1"):
+                elif nivel_cruzado(preco_ant, preco, a1, "ABAIXO") and not alerta_ja_enviado(f"{base}_a1"):
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A1")
                     enviar_telegram(
@@ -1274,26 +1276,20 @@ def monitorar_trades():
                         f"🔒 Mover Stop para ${entrada} (breakeven)\n"
                         f"⏳ Aguardar A2: ${a2}"
                     )
+
+            # ENTRADA: preco cruzou para cima o nivel de entrada
             if not alerta_ja_enviado(f"{base}_entrada"):
-                if preco >= entrada:
+                if nivel_cruzado(preco_ant, preco, entrada, "ACIMA"):
                     marcar_alerta(f"{base}_entrada")
-                    marcar_alerta(f"{base}_zona")
                     enviar_telegram(
                         f"🔴 <b>ENTRADA SHORT ACIONADA — {ativo} #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g}\n"
-                        f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
+                        f"💲 Preço: ${preco:.6g} | Nível: ${entrada}\n"
+                        f"📥 Stop: ${stop}\n"
                         f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
                     )
-                elif preco < entrada:
-                    distancia_pct = (entrada - preco) / entrada * 100
-                    if distancia_pct <= 3.0 and not alerta_ja_enviado(f"{base}_zona"):
-                        marcar_alerta(f"{base}_zona")
-                        enviar_telegram(
-                            f"👀 <b>ZONA DE ENTRADA — {ativo} SHORT #{tid}</b>\n"
-                            f"💲 Preço: ${preco:.6g} | Entrada: ${entrada}\n"
-                            f"📍 Preço a {round(distancia_pct,2)}% abaixo da entrada\n"
-                            f"⏳ Aguardando subida para acionar..."
-                        )
+
+        # Guardar preco atual para proxima iteracao
+        _preco_anterior[chave_ant] = preco
 
 def relatorio_diario():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
