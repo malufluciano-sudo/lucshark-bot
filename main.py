@@ -67,6 +67,17 @@ def init_db():
             criado_em TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS alertas_nivel (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ativo TEXT NOT NULL,
+            nivel REAL NOT NULL,
+            condicao TEXT NOT NULL,
+            nota TEXT,
+            disparado INTEGER DEFAULT 0,
+            criado_em TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -340,7 +351,7 @@ def parse_candle(c):
 
 
 # ============================================================
-# SCANNER METODOLOGIA AGREGADO v12.8
+# SCANNER METODOLOGIA AGREGADO v12.9
 # Wyckoff CORRETO: Lateralizacao + Compressao + Vol Crescente
 # O Tuk Tuk e a COMPRESSAO dentro do range, nao o rompimento.
 # ============================================================
@@ -526,7 +537,7 @@ def buscar_funding_rapido(symbol):
 
 def analisar_ativo_agregado(symbol):
     """
-    Scanner Wyckoff v12.8 — logica correta:
+    Scanner Wyckoff v12.9 — logica correta:
     1. Detectar lateralizacao no 1H
     2. Identificar Spring ou Upthrust dentro do range
     3. Identificar Tuk Tuk: velas pequenas com volume crescente dentro do range
@@ -599,7 +610,7 @@ def analisar_ativo_agregado(symbol):
 def rodar_scanner():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     enviar_telegram(
-        f"🔍 <b>SCANNER WYCKOFF v12.8</b>\n"
+        f"🔍 <b>SCANNER WYCKOFF v12.9</b>\n"
         f"{brt}\n"
         f"Lateralizacao + Tuk Tuk + Spring/UT | Funding &lt;1%\n"
         f"Analisando ativos..."
@@ -638,7 +649,7 @@ def rodar_scanner():
 
     if not resultados:
         enviar_telegram(
-            f"✅ <b>SCAN CONCLUIDO v12.8</b>\n"
+            f"✅ <b>SCAN CONCLUIDO v12.9</b>\n"
             f"{brt}\n"
             f"Analisados: {n_analisados} ativos\n"
             f"Nenhum ativo com Lateralizacao + Tuk Tuk + Funding &lt;1%."
@@ -650,7 +661,7 @@ def rodar_scanner():
 
     linhas = [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>SCANNER WYCKOFF v12.8</b>",
+        f"📊 <b>SCANNER WYCKOFF v12.9</b>",
         f"🕐 {brt}",
         f"✅ {len(resultados)} setups | {n_analisados} analisados",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -710,7 +721,7 @@ def rodar_scanner():
         if bloco:
             enviar_telegram("\n".join(bloco))
 
-    log.info(f"Scanner v12.8: {len(resultados)} setups de {n_analisados} ativos.")
+    log.info(f"Scanner v12.9: {len(resultados)} setups de {n_analisados} ativos.")
 
 def normalizar_symbol_coinalyze(symbol):
     s = symbol.upper().strip()
@@ -1045,7 +1056,7 @@ def buscar_preco_atual(ativo):
                 except:
                     continue
 
-    # v12.8 CORREÇÃO DEFINITIVA:
+    # v12.9 CORREÇÃO DEFINITIVA:
     # NÃO buscar candles LBank para high/low — ativos de outras exchanges
     # (BingX, Binance) retornam candles de símbolos errados na LBank,
     # causando acionamentos falsos de stop e alertas.
@@ -1106,6 +1117,87 @@ def calcular_duracao(criado_em):
     except:
         return "—"
 
+
+
+# ============================================================
+# ALERTAS DE NIVEL — v12.9
+# Dispara APENAS quando o preco cruza o valor exato registrado.
+# Usa nivel_cruzado() — mesma logica do monitoramento de trades.
+# Sem tolerancias, sem regioes, sem high/low de candle.
+# ============================================================
+
+_alerta_preco_anterior = {}
+
+def salvar_alerta_nivel(ativo, nivel, condicao, nota=""):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    agora = brt_agora().strftime("%Y-%m-%d %H:%M")
+    c.execute("""
+        INSERT INTO alertas_nivel (ativo, nivel, condicao, nota, criado_em)
+        VALUES (?,?,?,?,?)
+    """, (ativo.upper(), nivel, condicao.upper(), nota, agora))
+    conn.commit()
+    aid = c.lastrowid
+    conn.close()
+    return aid
+
+def listar_alertas_nivel():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, ativo, nivel, condicao, nota, criado_em
+        FROM alertas_nivel WHERE disparado=0 ORDER BY id DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def deletar_alerta_nivel(aid):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("UPDATE alertas_nivel SET disparado=1 WHERE id=?", (aid,))
+    conn.commit()
+    conn.close()
+
+def monitorar_alertas_nivel():
+    global _alerta_preco_anterior
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("SELECT id, ativo, nivel, condicao, nota FROM alertas_nivel WHERE disparado=0")
+    alertas = c.fetchall()
+    conn.close()
+    if not alertas:
+        return
+    for alerta in alertas:
+        aid, ativo, nivel, condicao, nota = alerta
+        dados = buscar_preco_atual(ativo)
+        if not dados:
+            continue
+        preco     = dados["preco"]
+        chave_ant = f"alerta_{aid}_{ativo}"
+        preco_ant = _alerta_preco_anterior.get(chave_ant)
+
+        # Usar nivel_cruzado — mesmo mecanismo dos trades
+        # Sem tolerancia, sem high/low, apenas preco last do ticker
+        disparar = False
+        if condicao == "ACIMA"  and nivel_cruzado(preco_ant, preco, nivel, "ACIMA"):
+            disparar = True
+        elif condicao == "ABAIXO" and nivel_cruzado(preco_ant, preco, nivel, "ABAIXO"):
+            disparar = True
+
+        if disparar:
+            deletar_alerta_nivel(aid)
+            seta  = "▲" if condicao == "ACIMA" else "▼"
+            nota_txt = f"\n📝 {nota}" if nota else ""
+            enviar_telegram(
+                f"🔔 <b>ALERTA #{aid} ACIONADO</b>\n"
+                f"📊 {ativo} | ${preco:.6g} {seta} ${nivel}{nota_txt}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"Envie o gráfico para análise completa."
+            )
+            log.info(f"Alerta #{aid} {ativo} disparado em ${preco:.6g}")
+        else:
+            _alerta_preco_anterior[chave_ant] = preco
 
 # Dicionario global para guardar preco anterior de cada trade
 # Permite detectar cruzamento de nivel mesmo que o ciclo pule sobre ele
@@ -1420,7 +1512,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v12.8"})
+    return jsonify({"status": "online", "version": "v12.9"})
 
 @flask_app.route("/")
 @flask_app.route("/dashboard")
@@ -1540,7 +1632,7 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.8 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.9 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1548,6 +1640,10 @@ def processar_comando(texto):
             "/trades — trades abertos\n"
             "/relatorio — estatísticas e P&L\n"
             "/semana — relatório da semana\n\n"
+            "<b>🔔 ALERTAS DE NÍVEL</b>\n"
+            "/alerta ATIVO NIVEL ACIMA|ABAIXO [nota]\n"
+            "/alertas — alertas ativos\n"
+            "/deletar_alerta ID — remover\n\n"
             "<b>🔍 SCANNER</b>\n"
             "/scan — rodar scanner agora\n"
             "/ativos — exchanges monitoradas\n\n"
@@ -1641,6 +1737,59 @@ def processar_comando(texto):
 
 
 
+
+
+    elif cmd == "/alerta":
+        # /alerta ATIVO NIVEL ACIMA|ABAIXO [nota]
+        # Ex: /alerta BSBUSDT 0.68000 ABAIXO retest VAH
+        if len(partes) < 4:
+            return (
+                "❌ Formato: /alerta ATIVO NIVEL ACIMA|ABAIXO [nota]\n\n"
+                "Exemplos:\n"
+                "/alerta BSBUSDT 0.68000 ABAIXO retest VAH\n"
+                "/alerta BTCUSDT 72000 ACIMA rompimento resistencia"
+            )
+        try:
+            ativo    = partes[1].upper()
+            nivel    = float(partes[2])
+            condicao = partes[3].upper()
+            nota     = " ".join(partes[4:]) if len(partes) > 4 else ""
+            if condicao not in ("ACIMA", "ABAIXO"):
+                return "❌ Condição deve ser ACIMA ou ABAIXO"
+            aid  = salvar_alerta_nivel(ativo, nivel, condicao, nota)
+            seta = "▲" if condicao == "ACIMA" else "▼"
+            return (
+                f"🔔 <b>Alerta #{aid} cadastrado!</b>\n"
+                f"📊 {ativo} | ${nivel} {seta} ({condicao})\n"
+                f"{'📝 ' + nota if nota else ''}\n"
+                f"✅ Dispara quando preço cruzar ${ nivel} — valor exato."
+            )
+        except Exception as e:
+            return f"❌ Erro: {e}"
+
+    elif cmd == "/alertas":
+        rows = listar_alertas_nivel()
+        if not rows:
+            return "📭 Nenhum alerta ativo."
+        linhas = ["🔔 <b>Alertas Ativos</b>\n"]
+        for r in rows:
+            aid, ativo, nivel, condicao, nota, criado = r
+            seta = "▲" if condicao == "ACIMA" else "▼"
+            linha = f"#{aid} {ativo} ${nivel} {seta}"
+            if nota:
+                linha += f" | {nota}"
+            linhas.append(linha)
+        linhas.append("\n/deletar_alerta ID — remover")
+        return "\n".join(linhas)
+
+    elif cmd == "/deletar_alerta":
+        if len(partes) < 2:
+            return "❌ Formato: /deletar_alerta ID"
+        try:
+            deletar_alerta_nivel(int(partes[1]))
+            return f"🗑 Alerta #{partes[1]} removido."
+        except Exception as e:
+            return f"❌ Erro: {e}"
 
     elif cmd == "/trades":
         rows = listar_trades()
@@ -1754,7 +1903,7 @@ def processar_comando(texto):
         n_abertos = c_st.fetchone()[0]
         conn_st.close()
         return (
-            f"✅ <b>LucSharkTrade v12.8 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.9 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
@@ -1797,6 +1946,11 @@ def loop_monitor_trades():
                 _estado["ultimo_monitor"] = time.time()
         except Exception as e:
             log.error(f"monitorar_trades erro: {e}")
+
+        try:
+            monitorar_alertas_nivel()
+        except Exception as e:
+            log.error(f"monitorar_alertas_nivel erro: {e}")
 
 
         # Relatórios automáticos (deduplicados via chave de janela)
@@ -1905,7 +2059,7 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.8 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.9 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
             f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
             f"✅ FIX: monitoramento em thread dedicada\n"
