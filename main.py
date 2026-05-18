@@ -67,20 +67,6 @@ def init_db():
             criado_em TEXT
         )
     """)
-    # v12.5: alertas de nivel de preco independentes de trades
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS alertas_nivel (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ativo TEXT NOT NULL,
-            direcao TEXT NOT NULL,
-            nivel REAL NOT NULL,
-            condicao TEXT NOT NULL,
-            nota TEXT,
-            ativo_flag INTEGER DEFAULT 1,
-            disparado INTEGER DEFAULT 0,
-            criado_em TEXT
-        )
-    """)
     conn.commit()
     conn.close()
 
@@ -1121,103 +1107,6 @@ def calcular_duracao(criado_em):
         return "—"
 
 
-# ============================================================
-# ALERTAS DE NIVEL DE PRECO (v12.5)
-# ============================================================
-# Permite cadastrar alertas de nivel sem abrir trade.
-# Comandos: /alerta, /alertas, /deletar_alerta
-# Monitorado no mesmo loop de monitorar_trades.
-# ============================================================
-
-def salvar_alerta_nivel(ativo, direcao, nivel, condicao, nota=""):
-    conn = sqlite3.connect("trades.db")
-    c = conn.cursor()
-    agora = brt_agora().strftime("%Y-%m-%d %H:%M")
-    c.execute("""
-        INSERT INTO alertas_nivel (ativo, direcao, nivel, condicao, nota, criado_em)
-        VALUES (?,?,?,?,?,?)
-    """, (ativo.upper(), direcao.upper(), nivel, condicao, nota, agora))
-    conn.commit()
-    aid = c.lastrowid
-    conn.close()
-    return aid
-
-def listar_alertas_nivel():
-    conn = sqlite3.connect("trades.db")
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, ativo, direcao, nivel, condicao, nota, criado_em
-        FROM alertas_nivel
-        WHERE ativo_flag=1 AND disparado=0
-        ORDER BY id DESC
-    """)
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def deletar_alerta_nivel(aid):
-    conn = sqlite3.connect("trades.db")
-    c = conn.cursor()
-    c.execute("UPDATE alertas_nivel SET ativo_flag=0 WHERE id=?", (aid,))
-    conn.commit()
-    conn.close()
-
-def marcar_alerta_nivel_disparado(aid):
-    conn = sqlite3.connect("trades.db")
-    c = conn.cursor()
-    c.execute("UPDATE alertas_nivel SET disparado=1, ativo_flag=0 WHERE id=?", (aid,))
-    conn.commit()
-    conn.close()
-
-def monitorar_alertas_nivel():
-    """Verifica alertas de nivel de preco e dispara notificacao."""
-    conn = sqlite3.connect("trades.db")
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, ativo, direcao, nivel, condicao, nota
-        FROM alertas_nivel
-        WHERE ativo_flag=1 AND disparado=0
-    """)
-    alertas = c.fetchall()
-    conn.close()
-
-    for alerta in alertas:
-        aid, ativo, direcao, nivel, condicao, nota = alerta
-        dados = buscar_preco_atual(ativo)
-        if not dados:
-            continue
-        preco = dados["preco"]
-        high  = dados.get("high", preco)
-        low   = dados.get("low", preco)
-
-        disparar = False
-        # ── CORREÇÃO v12.8 ──────────────────────────────────────────
-        # Usar APENAS o preco last para comparacao de alertas de nivel.
-        # O high/low intracandle so e confiavel para exchanges monitoradas.
-        # Para ativos de outras exchanges (BingX, Binance), o candle 5M
-        # pode retornar valores incorretos causando acionamentos falsos.
-        # Tolerancia de 0.1% para evitar miss por spread/slippage.
-        # ────────────────────────────────────────────────────────────
-        if condicao == "ACIMA" and preco >= nivel:
-            disparar = True
-        elif condicao == "ABAIXO" and preco <= nivel:
-            disparar = True
-
-        if disparar:
-            marcar_alerta_nivel_disparado(aid)
-            emoji = "🔔"
-            seta  = "▲" if condicao == "ACIMA" else "▼"
-            msg_nota = f"\n📝 {nota}" if nota else ""
-            enviar_telegram(
-                f"{emoji} <b>ALERTA ACIONADO #{aid}</b>\n"
-                f"📊 {ativo} | {direcao}\n"
-                f"💲 Preço: ${preco:.6g} | Nível: ${nivel} {seta}\n"
-                f"✅ Nível atingido — verificar setup!{msg_nota}\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"Envie o gráfico para análise completa."
-            )
-            log.info(f"Alerta #{aid} {ativo} disparado em ${preco:.6g}")
-
 def monitorar_trades():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -1663,10 +1552,6 @@ def processar_comando(texto):
             "/trades — trades abertos\n"
             "/relatorio — estatísticas e P&L\n"
             "/semana — relatório da semana\n\n"
-            "<b>🔔 ALERTAS DE NÍVEL</b>\n"
-            "/alerta ATIVO DIR NIVEL ACIMA|ABAIXO [nota]\n"
-            "/alertas — ver alertas ativos\n"
-            "/deletar_alerta ID — remover alerta\n\n"
             "<b>🔍 SCANNER</b>\n"
             "/scan — rodar scanner agora\n"
             "/ativos — exchanges monitoradas\n\n"
@@ -1758,66 +1643,9 @@ def processar_comando(texto):
 
 
 
-    elif cmd == "/alerta":
-        # /alerta ATIVO DIRECAO NIVEL CONDICAO [nota...]
-        # Ex: /alerta HYPEUSDT LONG 44000 ACIMA gatilho possivel long
-        # Ex: /alerta HYPEUSDT SHORT 38000 ABAIXO possivel short
-        if len(partes) < 5:
-            return (
-                "❌ Formato: /alerta ATIVO DIRECAO NIVEL CONDICAO [nota]\n\n"
-                "DIRECAO: LONG ou SHORT\n"
-                "CONDICAO: ACIMA ou ABAIXO\n\n"
-                "Exemplos:\n"
-                "/alerta HYPEUSDT LONG 44000 ACIMA gatilho long\n"
-                "/alerta BTCUSDT SHORT 82000 ACIMA rejeicao resistencia"
-            )
-        try:
-            ativo     = partes[1].upper()
-            direcao   = partes[2].upper()
-            nivel     = float(partes[3])
-            condicao  = partes[4].upper()
-            nota      = " ".join(partes[5:]) if len(partes) > 5 else ""
-            if direcao not in ("LONG", "SHORT"):
-                return "❌ DIRECAO deve ser LONG ou SHORT"
-            if condicao not in ("ACIMA", "ABAIXO"):
-                return "❌ CONDICAO deve ser ACIMA ou ABAIXO"
-            aid = salvar_alerta_nivel(ativo, direcao, nivel, condicao, nota)
-            seta = "▲" if condicao == "ACIMA" else "▼"
-            return (
-                f"🔔 <b>Alerta #{aid} cadastrado!</b>\n"
-                f"📊 {ativo} | {direcao}\n"
-                f"💲 Nível: ${nivel} {seta} ({condicao})\n"
-                f"{'📝 ' + nota if nota else ''}\n"
-                f"✅ Monitorando 24/7 — aviso quando atingir o nível."
-            )
-        except Exception as e:
-            return f"❌ Erro: {e}"
 
-    elif cmd == "/alertas":
-        rows = listar_alertas_nivel()
-        if not rows:
-            return "📭 Nenhum alerta de nível ativo."
-        linhas = ["🔔 <b>Alertas de Nível Ativos</b>\n"]
-        for r in rows:
-            aid, ativo, direcao, nivel, condicao, nota, criado = r
-            seta  = "▲" if condicao == "ACIMA" else "▼"
-            emoji = "🟢" if direcao == "LONG" else "🔴"
-            linha = f"{emoji} #{aid} {ativo} {direcao} | ${nivel} {seta}"
-            if nota:
-                linha += f" | {nota}"
-            linhas.append(linha)
-        linhas.append("\n/deletar_alerta ID — para remover um alerta")
-        return "\n".join(linhas)
 
-    elif cmd == "/deletar_alerta":
-        if len(partes) < 2:
-            return "❌ Formato: /deletar_alerta ID"
-        try:
-            aid = int(partes[1])
-            deletar_alerta_nivel(aid)
-            return f"🗑 Alerta #{aid} removido."
-        except Exception as e:
-            return f"❌ Erro: {e}"
+
     elif cmd == "/trades":
         rows = listar_trades()
         if not rows:
@@ -1974,10 +1802,6 @@ def loop_monitor_trades():
         except Exception as e:
             log.error(f"monitorar_trades erro: {e}")
 
-        try:
-            monitorar_alertas_nivel()
-        except Exception as e:
-            log.error(f"monitorar_alertas_nivel erro: {e}")
 
         # Relatórios automáticos (deduplicados via chave de janela)
         try:
