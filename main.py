@@ -78,6 +78,15 @@ def init_db():
             criado_em TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS alertas_preco (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ativo       TEXT UNIQUE,
+            suporte     REAL,
+            resistencia REAL,
+            criado_em   TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -351,7 +360,7 @@ def parse_candle(c):
 
 
 # ============================================================
-# SCANNER METODOLOGIA AGREGADO v12.9
+# SCANNER METODOLOGIA AGREGADO v12.10
 # Wyckoff CORRETO: Lateralizacao + Compressao + Vol Crescente
 # O Tuk Tuk e a COMPRESSAO dentro do range, nao o rompimento.
 # ============================================================
@@ -537,7 +546,7 @@ def buscar_funding_rapido(symbol):
 
 def analisar_ativo_agregado(symbol):
     """
-    Scanner Wyckoff v12.9 — logica correta:
+    Scanner Wyckoff v12.10 — logica correta:
     1. Detectar lateralizacao no 1H
     2. Identificar Spring ou Upthrust dentro do range
     3. Identificar Tuk Tuk: velas pequenas com volume crescente dentro do range
@@ -610,7 +619,7 @@ def analisar_ativo_agregado(symbol):
 def rodar_scanner():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     enviar_telegram(
-        f"🔍 <b>SCANNER WYCKOFF v12.9</b>\n"
+        f"🔍 <b>SCANNER WYCKOFF v12.10</b>\n"
         f"{brt}\n"
         f"Lateralizacao + Tuk Tuk + Spring/UT | Funding &lt;1%\n"
         f"Analisando ativos..."
@@ -649,7 +658,7 @@ def rodar_scanner():
 
     if not resultados:
         enviar_telegram(
-            f"✅ <b>SCAN CONCLUIDO v12.9</b>\n"
+            f"✅ <b>SCAN CONCLUIDO v12.10</b>\n"
             f"{brt}\n"
             f"Analisados: {n_analisados} ativos\n"
             f"Nenhum ativo com Lateralizacao + Tuk Tuk + Funding &lt;1%."
@@ -661,7 +670,7 @@ def rodar_scanner():
 
     linhas = [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>SCANNER WYCKOFF v12.9</b>",
+        f"📊 <b>SCANNER WYCKOFF v12.10</b>",
         f"🕐 {brt}",
         f"✅ {len(resultados)} setups | {n_analisados} analisados",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -721,7 +730,7 @@ def rodar_scanner():
         if bloco:
             enviar_telegram("\n".join(bloco))
 
-    log.info(f"Scanner v12.9: {len(resultados)} setups de {n_analisados} ativos.")
+    log.info(f"Scanner v12.10: {len(resultados)} setups de {n_analisados} ativos.")
 
 def normalizar_symbol_coinalyze(symbol):
     s = symbol.upper().strip()
@@ -1056,7 +1065,7 @@ def buscar_preco_atual(ativo):
                 except:
                     continue
 
-    # v12.9 CORREÇÃO DEFINITIVA:
+    # v12.10 CORREÇÃO DEFINITIVA:
     # NÃO buscar candles LBank para high/low — ativos de outras exchanges
     # (BingX, Binance) retornam candles de símbolos errados na LBank,
     # causando acionamentos falsos de stop e alertas.
@@ -1120,7 +1129,7 @@ def calcular_duracao(criado_em):
 
 
 # ============================================================
-# ALERTAS DE NIVEL — v12.9
+# ALERTAS DE NIVEL — v12.10
 # Dispara APENAS quando o preco cruza o valor exato registrado.
 # Usa nivel_cruzado() — mesma logica do monitoramento de trades.
 # Sem tolerancias, sem regioes, sem high/low de candle.
@@ -1151,6 +1160,29 @@ def listar_alertas_nivel():
     rows = c.fetchall()
     conn.close()
     return rows
+
+# ─── ALERTAS DE PREÇO (FAIXA SUPORTE/RESISTÊNCIA) ────────────────────────────
+def salvar_alerta_preco(ativo, suporte, resistencia):
+    with sqlite3.connect("trades.db") as con:
+        con.execute("""
+            INSERT INTO alertas_preco (ativo, suporte, resistencia, criado_em)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ativo) DO UPDATE SET
+                suporte=excluded.suporte,
+                resistencia=excluded.resistencia,
+                criado_em=excluded.criado_em
+        """, (ativo.upper(), suporte, resistencia, brt_agora().strftime("%Y-%m-%d %H:%M")))
+
+def remover_alerta_preco(ativo):
+    with sqlite3.connect("trades.db") as con:
+        cur = con.execute("DELETE FROM alertas_preco WHERE ativo=?", (ativo.upper(),))
+        return cur.rowcount > 0
+
+def listar_alertas_preco():
+    with sqlite3.connect("trades.db") as con:
+        return con.execute(
+            "SELECT ativo, suporte, resistencia, criado_em FROM alertas_preco ORDER BY criado_em DESC"
+        ).fetchall()
 
 def deletar_alerta_nivel(aid):
     conn = sqlite3.connect("trades.db")
@@ -1383,6 +1415,37 @@ def monitorar_trades():
         # Guardar preco atual para proxima iteracao
         _preco_anterior[chave_ant] = preco
 
+
+    # ─── MONITORAR ALERTAS DE PREÇO (FAIXA SUPORTE/RESISTÊNCIA) ─────────────
+    alertas_p = listar_alertas_preco()
+    for (ativo_a, suporte, resistencia, _) in alertas_p:
+        try:
+            preco_info = buscar_preco_atual(ativo_a)
+            if not preco_info:
+                continue
+            low_a  = preco_info.get("low",  preco_info["preco"])
+            high_a = preco_info.get("high", preco_info["preco"])
+            chave_sup = f"ap_{ativo_a}_suporte_{suporte}"
+            chave_res = f"ap_{ativo_a}_resistencia_{resistencia}"
+            if low_a <= suporte * 1.002 and not alerta_ja_enviado(chave_sup):
+                marcar_alerta(chave_sup)
+                enviar_telegram(
+                    f"📍 <b>ALERTA DE PREÇO — {ativo_a}</b>\n"
+                    f"🟢 Tocou <b>SUPORTE</b> ${suporte:,.2f}\n"
+                    f"Preço atual: ${preco_info['preco']:,.2f}\n"
+                    f"⚠️ Zona de decisão — aguardar confirmação de setup"
+                )
+            if high_a >= resistencia * 0.998 and not alerta_ja_enviado(chave_res):
+                marcar_alerta(chave_res)
+                enviar_telegram(
+                    f"📍 <b>ALERTA DE PREÇO — {ativo_a}</b>\n"
+                    f"🔴 Tocou <b>RESISTÊNCIA</b> ${resistencia:,.2f}\n"
+                    f"Preço atual: ${preco_info['preco']:,.2f}\n"
+                    f"⚠️ Zona de decisão — aguardar confirmação de setup"
+                )
+        except Exception as e:
+            log.error(f"Erro monitorando alerta_preco {ativo_a}: {e}")
+
 def relatorio_diario():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     total, wins, loss, abertos, wr = relatorio()
@@ -1512,7 +1575,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v12.9"})
+    return jsonify({"status": "online", "version": "v12.10"})
 
 @flask_app.route("/")
 @flask_app.route("/dashboard")
@@ -1632,7 +1695,7 @@ def processar_comando(texto):
 
     if cmd in ["/start", "/ajuda"]:
         return (
-            "🤖 <b>LucSharkTrade v12.9 — Comandos</b>\n\n"
+            "🤖 <b>LucSharkTrade v12.10 — Comandos</b>\n\n"
             "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
@@ -1644,6 +1707,8 @@ def processar_comando(texto):
             "/alerta ATIVO NIVEL ACIMA|ABAIXO [nota]\n"
             "/alertas — alertas ativos\n"
             "/deletar_alerta ID — remover\n\n"
+            "📍 /alerta ATIVO SUP RES  — faixa suporte/resistência\n"
+            "🗑 /delalerta ATIVO       — remove alerta de faixa\n\n"
             "<b>🔍 SCANNER</b>\n"
             "/scan — rodar scanner agora\n"
             "/ativos — exchanges monitoradas\n\n"
@@ -1740,46 +1805,79 @@ def processar_comando(texto):
 
 
     elif cmd == "/alerta":
-        # /alerta ATIVO NIVEL ACIMA|ABAIXO [nota]
-        # Ex: /alerta BSBUSDT 0.68000 ABAIXO retest VAH
-        if len(partes) < 4:
+        # Formato faixa: /alerta ATIVO SUPORTE RESISTENCIA (dois números)
+        # Formato nível: /alerta ATIVO NIVEL ACIMA|ABAIXO [nota]
+        if len(partes) < 3:
             return (
-                "❌ Formato: /alerta ATIVO NIVEL ACIMA|ABAIXO [nota]\n\n"
-                "Exemplos:\n"
-                "/alerta BSBUSDT 0.68000 ABAIXO retest VAH\n"
-                "/alerta BTCUSDT 72000 ACIMA rompimento resistencia"
+                "⚠️ Uso:\n"
+                "📍 Faixa: /alerta ATIVO SUPORTE RESISTENCIA\n"
+                "   Ex: /alerta BTCUSDT 59000 64500\n\n"
+                "🔔 Nível: /alerta ATIVO NIVEL ACIMA|ABAIXO [nota]\n"
+                "   Ex: /alerta BTCUSDT 72000 ACIMA rompimento"
             )
-        try:
-            ativo    = partes[1].upper()
-            nivel    = float(partes[2])
-            condicao = partes[3].upper()
-            nota     = " ".join(partes[4:]) if len(partes) > 4 else ""
-            if condicao not in ("ACIMA", "ABAIXO"):
-                return "❌ Condição deve ser ACIMA ou ABAIXO"
-            aid  = salvar_alerta_nivel(ativo, nivel, condicao, nota)
-            seta = "▲" if condicao == "ACIMA" else "▼"
+        ativo_a = partes[1].upper()
+        terceiro = partes[3].upper() if len(partes) > 3 else ""
+        if terceiro in ("ACIMA", "ABAIXO") or len(partes) == 3:
+            # FORMATO NÍVEL
+            if len(partes) < 4:
+                return "❌ Nível: /alerta ATIVO NIVEL ACIMA|ABAIXO [nota]"
+            try:
+                nivel    = float(partes[2])
+                condicao = partes[3].upper()
+                nota     = " ".join(partes[4:]) if len(partes) > 4 else ""
+                if condicao not in ("ACIMA", "ABAIXO"):
+                    return "❌ Condição deve ser ACIMA ou ABAIXO"
+                aid  = salvar_alerta_nivel(ativo_a, nivel, condicao, nota)
+                seta = "▲" if condicao == "ACIMA" else "▼"
+                return (
+                    f"🔔 <b>Alerta nível #{aid} cadastrado!</b>\n"
+                    f"📊 {ativo_a} | ${nivel} {seta} ({condicao})\n"
+                    f"{'📝 ' + nota if nota else ''}\n"
+                    f"✅ Dispara quando preço cruzar ${nivel}"
+                )
+            except Exception as e:
+                return f"❌ Erro: {e}"
+        else:
+            # FORMATO FAIXA (SUPORTE + RESISTÊNCIA)
+            if len(partes) != 4:
+                return "⚠️ Faixa: /alerta ATIVO SUPORTE RESISTENCIA\nEx: /alerta BTCUSDT 59000 64500"
+            try:
+                sup = float(partes[2])
+                res = float(partes[3])
+            except ValueError:
+                return "⚠️ Preços inválidos. Use números."
+            if sup >= res:
+                return "⚠️ Suporte deve ser menor que resistência."
+            salvar_alerta_preco(ativo_a, sup, res)
             return (
-                f"🔔 <b>Alerta #{aid} cadastrado!</b>\n"
-                f"📊 {ativo} | ${nivel} {seta} ({condicao})\n"
-                f"{'📝 ' + nota if nota else ''}\n"
-                f"✅ Dispara quando preço cruzar ${ nivel} — valor exato."
+                f"📍 <b>Alerta de faixa cadastrado!</b>\n"
+                f"📊 Ativo: <b>{ativo_a}</b>\n"
+                f"🟢 Suporte: ${sup:,.2f}\n"
+                f"🔴 Resistência: ${res:,.2f}\n"
+                f"🔄 Monitorando 24/7..."
             )
-        except Exception as e:
-            return f"❌ Erro: {e}"
 
     elif cmd == "/alertas":
-        rows = listar_alertas_nivel()
-        if not rows:
+        rows_nivel = listar_alertas_nivel()
+        rows_preco = listar_alertas_preco()
+        if not rows_nivel and not rows_preco:
             return "📭 Nenhum alerta ativo."
-        linhas = ["🔔 <b>Alertas Ativos</b>\n"]
-        for r in rows:
-            aid, ativo, nivel, condicao, nota, criado = r
-            seta = "▲" if condicao == "ACIMA" else "▼"
-            linha = f"#{aid} {ativo} ${nivel} {seta}"
-            if nota:
-                linha += f" | {nota}"
-            linhas.append(linha)
-        linhas.append("\n/deletar_alerta ID — remover")
+        linhas = []
+        if rows_nivel:
+            linhas.append("🔔 <b>Alertas de Nível</b>")
+            for r in rows_nivel:
+                aid, ativo, nivel, condicao, nota, criado = r
+                seta = "▲" if condicao == "ACIMA" else "▼"
+                linha = f"  #{aid} {ativo} ${nivel} {seta}"
+                if nota:
+                    linha += f" | {nota}"
+                linhas.append(linha)
+            linhas.append("  /deletar_alerta ID — remover\n")
+        if rows_preco:
+            linhas.append("📍 <b>Alertas de Faixa</b>")
+            for (ativo_a, sup, res, criado) in rows_preco:
+                linhas.append(f"  • <b>{ativo_a}</b> — 🟢 ${sup:,.2f} | 🔴 ${res:,.2f}")
+            linhas.append("  /delalerta ATIVO — remover")
         return "\n".join(linhas)
 
     elif cmd == "/deletar_alerta":
@@ -1880,6 +1978,18 @@ def processar_comando(texto):
             return "📋 Blacklist vazia"
         return "🚫 <b>Blacklist</b>\n" + "\n".join(f"  • {a}" for a in sorted(bl))
 
+    elif cmd == "/delalerta":
+        partes = texto.strip().split()
+        if len(partes) != 2:
+            return "⚠️ Uso: /delalerta ATIVO\nEx: /delalerta BTCUSDT"
+        ativo_a = partes[1].upper()
+        ok = remover_alerta_preco(ativo_a)
+        if ok:
+            with sqlite3.connect("trades.db") as con:
+                con.execute("DELETE FROM alertas_log WHERE chave LIKE ?", (f"ap_{ativo_a}_%",))
+            return f"🗑 Alerta de faixa de <b>{ativo_a}</b> removido."
+        return f"⚠️ Nenhum alerta de faixa encontrado para {ativo_a}."
+
     elif cmd == "/ativos":
         linhas = ["📡 <b>Ativos — Multi-Exchange</b>\n"]
         total  = 0
@@ -1903,7 +2013,7 @@ def processar_comando(texto):
         n_abertos = c_st.fetchone()[0]
         conn_st.close()
         return (
-            f"✅ <b>LucSharkTrade v12.9 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v12.10 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
@@ -2059,7 +2169,7 @@ def main():
 
     if enviar_online:
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.9 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade v12.10 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
             f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
             f"✅ FIX: monitoramento em thread dedicada\n"
