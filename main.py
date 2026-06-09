@@ -1569,7 +1569,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v13.4"})
+    return jsonify({"status": "online", "version": "v13.5"})
 
 
 @flask_app.route("/api/jj/sinal", methods=["POST"])
@@ -2197,11 +2197,23 @@ def loop_comandos_telegram():
             cmd_base = texto.split()[0].lower().split("@")[0]
             topic = tg13.topic_for_cmd(cmd_base)
             chat  = msg.get("chat", {})
-            if chat.get("type") in ("group", "supergroup"):
-                tg13.garantir_topics_grupo(chat["id"])
             log.info(f"Comando recebido: {texto} → topic {topic}")
 
             try:
+                if cmd_base == "/ping":
+                    tg13.responder_comando(
+                        msg,
+                        f"🏓 <b>PONG</b> — {tg13.VERSION} ONLINE\n"
+                        f"Topics: {'ON' if tg13.topics_ativos() else 'OFF'}",
+                    )
+                    continue
+
+                if chat.get("type") in ("group", "supergroup"):
+                    try:
+                        tg13.garantir_topics_grupo(chat["id"])
+                    except Exception as e:
+                        log.warning(f"garantir topics: {e}")
+
                 if cmd_base == "/debug_topics":
                     tg13.responder_comando(msg, tg13.debug_topics_text(msg))
                     continue
@@ -2272,6 +2284,7 @@ def loop_comandos_telegram():
 
 def main():
     init_db()
+    tg13.deletar_webhook()
     tg13.carregar_topics_persistidos()
     grp = os.environ.get("TELEGRAM_GROUP_ID", "") or tg13._chat_id_persistido()
     if grp:

@@ -6,13 +6,14 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
 
 log = logging.getLogger(__name__)
 
-VERSION = "v13.4"
+VERSION = "v13.5"
 OFFSET_BRT = -3
 
 TOPIC_PLAN = [
@@ -71,7 +72,10 @@ CMD_TOPIC = {
     "/setup_topics": "geral",
     "/auto_setup": "geral",
     "/limpar_duplicados": "geral",
+    "/ping": "geral",
 }
+
+_rediscover_cache_ts = 0.0
 
 BOT_COMMANDS = [
     {"command": "ajuda", "description": "Menu de comandos"},
@@ -146,11 +150,31 @@ def rediscover_topics(chat_id: int) -> bool:
     return encontrados > 0
 
 
-def garantir_topics_grupo(chat_id: int) -> bool:
+def garantir_topics_grupo(chat_id: int, force: bool = False) -> bool:
+    global _rediscover_cache_ts
     carregar_topics_persistidos()
     if topics_ativos():
         return True
-    return rediscover_topics(chat_id)
+    if not force and (time.time() - _rediscover_cache_ts) < 1800:
+        return False
+    ok = rediscover_topics(chat_id)
+    if ok:
+        _rediscover_cache_ts = time.time()
+    return ok
+
+
+def deletar_webhook():
+    token = _token()
+    if not token:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/deleteWebhook",
+            json={"drop_pending_updates": False},
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning("deleteWebhook: %s", e)
 
 
 def responder_comando(msg: dict, texto: str, keyboard: dict | None = None):
@@ -636,7 +660,14 @@ def auto_setup_grupo(chat_id: int) -> str:
         f"📍 Fixar mensagens: {pin_txt}\n\n"
         f"<b>Tópicos ativos:</b>\n" + "\n".join(linhas_ids) + "\n\n"
         f"🗂 <b>Topics ON</b> — mensagens já vão para cada canal.\n"
-        f"Teste: /status no Geral, /trade no Trades."
+        f"Teste: /status no Geral, /trade no Trades.\n\n"
+        f"<b>Copie no Railway → Variables (permanente):</b>\n"
+        f"<code>TELEGRAM_CHAT_ID={chat_id}</code>\n"
+        f"<code>TELEGRAM_GROUP_ID={chat_id}</code>\n"
+        + "\n".join(
+            f"<code>TOPIC_{k.upper()}={TOPICS[k]}</code>"
+            for k, _ in TOPIC_PLAN if TOPICS.get(k)
+        )
     )
 
 
