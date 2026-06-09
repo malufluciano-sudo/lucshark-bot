@@ -1569,7 +1569,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v13.2"})
+    return jsonify({"status": "online", "version": "v13.3"})
 
 
 @flask_app.route("/api/jj/sinal", methods=["POST"])
@@ -2201,6 +2201,22 @@ def loop_comandos_telegram():
             try:
                 if cmd_base == "/debug_topics":
                     enviar_telegram(tg13.debug_topics_text(msg), topic="geral")
+                    continue
+
+                if cmd_base == "/limpar_duplicados":
+                    chat = msg.get("chat", {})
+                    if chat.get("type") not in ("group", "supergroup"):
+                        enviar_telegram(
+                            "❌ Use /limpar_duplicados no grupo LucShark Trading.",
+                            topic="geral",
+                        )
+                        continue
+                    resultado = tg13.limpar_topics_duplicados(chat["id"])
+                    tg13.enviar_para_chat(
+                        chat["id"],
+                        resultado,
+                        thread=msg.get("message_thread_id"),
+                    )
                     continue
 
                 if cmd_base == "/auto_setup":

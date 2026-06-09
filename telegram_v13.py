@@ -12,7 +12,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
-VERSION = "v13.2"
+VERSION = "v13.3"
 OFFSET_BRT = -3
 
 TOPIC_PLAN = [
@@ -70,6 +70,7 @@ CMD_TOPIC = {
     "/editar": "trades",
     "/setup_topics": "geral",
     "/auto_setup": "geral",
+    "/limpar_duplicados": "geral",
 }
 
 BOT_COMMANDS = [
@@ -87,7 +88,18 @@ BOT_COMMANDS = [
     {"command": "debug_topics", "description": "ID do tópico atual"},
     {"command": "setup_topics", "description": "Guia rápido Topics"},
     {"command": "auto_setup", "description": "Criar Topics automaticamente"},
+    {"command": "limpar_duplicados", "description": "Remover tópicos duplicados"},
 ]
+
+# Nomes equivalentes (evita criar 2x Geral / General)
+_NOME_ALIASES = {
+    "geral": ("geral", "general"),
+    "trades": ("trades", "trade"),
+    "alertas": ("alertas", "alerta"),
+    "scanner": ("scanner", "scan"),
+    "relatorios": ("relatorios", "relatorio"),
+    "analises": ("analises", "analise", "análises"),
+}
 
 
 def carregar_topics_persistidos():
@@ -350,9 +362,9 @@ def _bot_user_id() -> int | None:
     return None
 
 
-def _listar_forum_topics(chat_id: int) -> dict:
-    """Retorna mapa nome_lower -> message_thread_id."""
-    out = {}
+def _listar_forum_topics_all(chat_id: int) -> list:
+    """Lista completa de tópicos (suporta nomes duplicados)."""
+    out = []
     offset = 0
     while True:
         data = tg_request("getForumTopics", {
@@ -364,16 +376,130 @@ def _listar_forum_topics(chat_id: int) -> dict:
             break
         batch = data["result"].get("topics", [])
         for t in batch:
-            name = (t.get("name") or "").strip().lower()
             tid = t.get("message_thread_id")
-            if name and tid:
-                out[name] = tid
-            if t.get("is_general"):
-                out["geral"] = tid
+            if not tid:
+                continue
+            out.append({
+                "id": int(tid),
+                "name": (t.get("name") or "").strip(),
+                "is_general": bool(t.get("is_general")),
+            })
         if not data["result"].get("has_more_topics", False):
             break
         offset += len(batch)
     return out
+
+
+def _listar_forum_topics(chat_id: int) -> dict:
+    """Mapa nome_lower -> message_thread_id (último visto)."""
+    out = {}
+    for t in _listar_forum_topics_all(chat_id):
+        nl = t["name"].lower()
+        if nl:
+            out[nl] = t["id"]
+        if t["is_general"]:
+            out["geral"] = t["id"]
+    return out
+
+
+def _topic_key_por_nome(name: str, is_general: bool = False) -> str | None:
+    if is_general:
+        return None  # # General nativo — nunca apagar
+    nl = name.strip().lower()
+    for key, aliases in _NOME_ALIASES.items():
+        if nl in aliases:
+            return key
+    return None
+
+
+def _deletar_forum_topic(chat_id: int, thread_id: int) -> bool:
+    data = tg_request("deleteForumTopic", {
+        "chat_id": chat_id,
+        "message_thread_id": thread_id,
+    })
+    return bool(data and data.get("ok"))
+
+
+def limpar_topics_duplicados(chat_id: int) -> str:
+    """
+    Remove tópicos duplicados (ex: 2x Geral, 2x Trades).
+    Mantém os IDs salvos pelo /auto_setup. Não apaga # General nativo.
+    """
+    carregar_topics_persistidos()
+    canonical = {}
+    for key, _ in TOPIC_PLAN:
+        cid = TOPICS.get(key) or sistema_get(f"topic_{key}")
+        if cid:
+            try:
+                canonical[key] = int(cid)
+            except (TypeError, ValueError):
+                pass
+
+    if not canonical:
+        return (
+            "❌ Nenhum tópico canônico salvo.\n"
+            "Envie /auto_setup@LucSharkBot primeiro."
+        )
+
+    todos = _listar_forum_topics_all(chat_id)
+    por_chave: dict[str, list] = {}
+    for t in todos:
+        if t["is_general"]:
+            continue
+        chave = _topic_key_por_nome(t["name"])
+        if not chave:
+            continue
+        por_chave.setdefault(chave, []).append(t)
+
+    removidos = []
+    mantidos = []
+    erros = []
+
+    for chave, lista in por_chave.items():
+        if len(lista) <= 1:
+            if lista:
+                mantidos.append(f"{lista[0]['name']} (id {lista[0]['id']})")
+            continue
+
+        canon_id = canonical.get(chave)
+        manter = None
+        if canon_id:
+            manter = next((t for t in lista if t["id"] == canon_id), None)
+        if not manter:
+            manter = max(lista, key=lambda x: x["id"])
+
+        mantidos.append(f"{manter['name']} (id {manter['id']}) ✅")
+        sistema_set(f"topic_{chave}", manter["id"])
+        TOPICS[chave] = manter["id"]
+
+        for t in lista:
+            if t["id"] == manter["id"]:
+                continue
+            if _deletar_forum_topic(chat_id, t["id"]):
+                removidos.append(f"{t['name']} (id {t['id']})")
+            else:
+                erros.append(f"{t['name']} (id {t['id']})")
+
+    sistema_set("telegram_chat_id", str(chat_id))
+    carregar_topics_persistidos()
+
+    linhas = [
+        f"🧹 <b>LIMPEZA DE TÓPICOS — {VERSION}</b>\n",
+        f"<b>Mantidos:</b>",
+    ]
+    linhas += [f"  • {m}" for m in mantidos] or ["  • nenhum duplicado"]
+    if removidos:
+        linhas += ["", "<b>Removidos:</b>"] + [f"  🗑 {r}" for r in removidos]
+    else:
+        linhas += ["", "✅ Nenhum duplicado para remover."]
+    if erros:
+        linhas += ["", "<b>Erros (apague manualmente):</b>"] + [f"  ⚠️ {e}" for e in erros]
+    linhas += [
+        "",
+        "ℹ️ <b># General</b> é nativo do Telegram — permanece, pode ignorar.",
+        "Use só o <b>Geral</b> canônico (✅) daqui pra frente.",
+    ]
+    return "\n".join(linhas)
 
 
 def auto_setup_grupo(chat_id: int) -> str:
@@ -420,14 +546,18 @@ def auto_setup_grupo(chat_id: int) -> str:
     if not perms:
         return "❌ Ative a permissão <b>Gerenciar tópicos</b> para o bot."
 
-    existentes = _listar_forum_topics(chat_id)
+    todos = _listar_forum_topics_all(chat_id)
     criados = []
     reutilizados = []
     linhas_ids = []
 
     for key, nome in TOPIC_PLAN:
-        nl = nome.lower()
-        thread_id = existentes.get(nl) or existentes.get(key)
+        aliases = _NOME_ALIASES.get(key, (nome.lower(),))
+        candidatos = [
+            t for t in todos
+            if not t["is_general"] and t["name"].lower() in aliases
+        ]
+        thread_id = candidatos[0]["id"] if candidatos else None
         if not thread_id:
             resp = tg_request("createForumTopic", {"chat_id": chat_id, "name": nome})
             if not resp or not resp.get("ok"):
