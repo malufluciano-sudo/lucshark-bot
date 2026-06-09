@@ -1,14 +1,16 @@
-# LucSharkTrade v13.0 — Guia de Migração
+# LucSharkTrade v13.1 — Guia de Migração
 
-## O que mudou
+## O que mudou (v13.1)
 
-- **Topics** — mensagens separadas por canal (Geral, Trades, Alertas, Scanner, Relatórios)
-- **Dashboard pinado** — lista de trades abertos fixada no topic Trades
-- **Mensagem mãe + replies** — cada trade = 1 card; eventos (A1, stop…) viram reply (notificação push)
-- **Botões inline** — A1 / A2 / A3 / STOP / FECHAR nos trades
-- **/alertas interativo** — botões para remover alertas
-- **/debug_topics** — descobre IDs dos tópicos automaticamente
-- **Fallback** — sem Topics configurados, tudo funciona no chat atual (como hoje)
+- **Topics** — mensagens por canal (Geral, Trades, Alertas, Scanner, Relatórios, Análises)
+- **Dashboard pinado** + **preço ao vivo** nos cards de trade
+- **Botões** — ENTRADA / A1-A3 / STOP e FECHAR com **confirmação em 2 toques** / EDITAR
+- **/preco** / **/watch** / **/watchlist** — consulta e scanner focado
+- **Scanner** — bloco 🚨 PRIORIDADE (score ≥ 80)
+- **Topic Análises** — envie print; bot responde com checklist Wyckoff
+- **Menu de comandos** — `/` no Telegram lista comandos
+- **Integração JJ** — webhook `POST /api/jj/sinal` + variáveis no rastreador
+- **Fallback** — sem Topics, tudo no chat atual
 
 ## Passo 1 — Grupo no Telegram (única parte manual)
 
@@ -84,6 +86,26 @@ Procure `"chat":{"id":-100...}` — esse número negativo é o chat ID.
 | `/scan` | Scanner |
 | `/relatorio` | Relatórios |
 | Toque em ✅ A1 num trade | Reply + card atualizado |
+
+## Integração Jeova Jireh (opcional)
+
+No **Railway** (lucshark-bot):
+```
+JJ_WEBHOOK_SECRET=uma_senha_forte
+```
+
+No **JJ** `.env` (escolha uma opção):
+
+**Opção A — Webhook** (LucShark roteia para topic Scanner):
+```
+LUCSHARK_WEBHOOK_URL=https://seu-app.railway.app/api/jj/sinal
+LUCSHARK_WEBHOOK_SECRET=mesma_senha
+```
+
+**Opção B — Telegram direto** com topic:
+```
+TELEGRAM_TOPIC_SCANNER=12345
+```
 
 ## Saved Messages (opcional)
 

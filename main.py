@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import json
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import telegram_v13 as tg13
 
 flask_app = Flask(__name__)
@@ -890,6 +890,13 @@ def rodar_scanner():
             pares.append(p)
     pares = pares[:600]
 
+    wl_rows = tg13.watchlist_listar()
+    if wl_rows:
+        def _norm(s):
+            return s.upper().replace("/", "").replace("-", "").replace("_", "")
+        wl_norm = {_norm(a) for a, _ in wl_rows}
+        pares = [p for p in pares if _norm(p) in wl_norm]
+
     blacklist  = get_blacklist()
     resultados = []
     n_analisados = 0
@@ -920,17 +927,28 @@ def rodar_scanner():
         return
 
     # Separar por prioridade e direcao
+    prio   = [r for r in resultados if r.get("score", 0) >= 80]
+    demais = [r for r in resultados if r.get("score", 0) < 80]
     longs  = [r for r in resultados if r["bias_1h"] == "LONG"]
     shorts = [r for r in resultados if r["bias_1h"] == "SHORT"]
 
     linhas = [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>SCANNER AGREGADO</b>",
+        f"📊 <b>SCANNER AGREGADO {tg13.VERSION}</b>",
         f"🕐 {brt}",
         f"✅ {len(resultados)} setups | {n_analisados} analisados",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         ""
     ]
+
+    if prio:
+        linhas.append(f"🚨 <b>PRIORIDADE — Score ≥ 80 ({len(prio)})</b>\n")
+        for i, r in enumerate(prio[:10], 1):
+            linhas.append(
+                f"{i}. <b>{r['symbol']}</b> {r['bias_1h']} "
+                f"| Score <b>{r['score']}</b> | 💲{r['preco']:.6g}"
+            )
+        linhas.append("")
 
     if longs:
         linhas.append(f"🟢 <b>LONG — Tuk Tuk ▲ alinhado com 1H</b>\n")
@@ -1551,7 +1569,23 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v13.0"})
+    return jsonify({"status": "online", "version": "v13.1"})
+
+
+@flask_app.route("/api/jj/sinal", methods=["POST"])
+def api_jj_sinal():
+    """Recebe sinais externos (ex: Jeova Jireh rastreador) — opcional."""
+    secret = os.environ.get("JJ_WEBHOOK_SECRET", "")
+    if secret and request.headers.get("X-JJ-Secret") != secret:
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    msg = data.get("mensagem") or data.get("message")
+    if not msg:
+        return jsonify({"error": "mensagem obrigatória"}), 400
+    tipo = data.get("tipo", "scanner")
+    prioridade = bool(data.get("prioridade", False))
+    tg13.enviar_sinal_externo(str(msg), tipo=tipo, prioridade=prioridade)
+    return jsonify({"ok": True, "version": "v13.1"})
 
 @flask_app.route("/")
 @flask_app.route("/dashboard")
@@ -1683,25 +1717,82 @@ def processar_comando(texto):
     if cmd in ["/start", "/ajuda"]:
         topics_txt = "✅ Topics ativos" if tg13.topics_ativos() else "⚠️ Topics OFF — chat único (configure TOPIC_* no Railway)"
         return (
-            "🤖 <b>LucSharkTrade v13.0 — Comandos</b>\n"
+            f"🤖 <b>LucSharkTrade {tg13.VERSION} — Comandos</b>\n"
             f"{topics_txt}\n\n"
-            "<b>📊 TRADES</b> (topic Trades)\n"
+            "<b>📊 TRADES</b>\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
-            "/fechar ID PRECO [motivo]\n"
-            "/trades — lista rápida | Dashboard pinado automático\n"
-            "Botões inline: ENTRADA / A1 / A2 / A3 / STOP / FECHAR\n\n"
-            "<b>🔔 ALERTAS</b> (topic Alertas)\n"
-            "/alerta ATIVO NIVEL ACIMA|ABAIXO [nota]\n"
-            "/alerta ATIVO SUP RES — faixa S/R\n"
-            "/alertas — lista com botões 🗑\n\n"
-            "<b>🔍 SCANNER</b> (topic Scanner)\n"
-            "/scan — rodar agora\n\n"
-            "<b>📊 RELATÓRIOS</b> (topic Relatórios)\n"
-            "/relatorio | /semana (auto 18h e seg 9h)\n\n"
-            "<b>⚙️ SISTEMA</b> (topic Geral)\n"
-            "/status | /debug | /debug_topics\n"
+            "/editar ID entrada|stop|a1|a2|a3 VALOR\n"
+            "/fechar ID PRECO [motivo] | /trades\n"
+            "Botões: ENTRADA / A1-A3 / STOP / FECHAR / EDITAR\n\n"
+            "<b>🔔 ALERTAS</b>\n"
+            "/alerta … | /alertas\n\n"
+            "<b>🔍 SCANNER</b>\n"
+            "/scan | /watch ATIVO | /unwatch ATIVO | /watchlist\n\n"
+            "<b>📈 MERCADO</b>\n"
+            "/preco ATIVO\n\n"
+            "<b>📊 RELATÓRIOS</b>\n"
+            "/relatorio | /semana\n\n"
+            "<b>⚙️ SISTEMA</b>\n"
+            "/status | /debug | /debug_topics | /setup_topics\n"
             "/parar | /ajuda"
         )
+
+    elif cmd == "/setup_topics":
+        return tg13.setup_topics_guia()
+
+    elif cmd == "/preco":
+        if len(partes) < 2:
+            return "❌ Formato: /preco ATIVO"
+        ativo = partes[1].upper()
+        dados = buscar_preco_atual(ativo)
+        if not dados:
+            return f"❌ Sem preço para {ativo}"
+        p = dados["preco"]
+        return (
+            f"💲 <b>{ativo}</b>\n"
+            f"Preço: <b>${p:,.6g}</b>\n"
+            f"Bid: ${dados.get('bid', p):,.6g} | Ask: ${dados.get('ask', p):,.6g}"
+        )
+
+    elif cmd == "/watch":
+        if len(partes) < 2:
+            return "❌ Formato: /watch ATIVO"
+        ativo = partes[1].upper()
+        tg13.watchlist_add(ativo)
+        return f"✅ {ativo} adicionado à watchlist."
+
+    elif cmd == "/unwatch":
+        if len(partes) < 2:
+            return "❌ Formato: /unwatch ATIVO"
+        ativo = partes[1].upper()
+        if tg13.watchlist_remove(ativo):
+            return f"✅ {ativo} removido da watchlist."
+        return f"⚠️ {ativo} não estava na watchlist."
+
+    elif cmd == "/watchlist":
+        rows = tg13.watchlist_listar()
+        if not rows:
+            return "📋 Watchlist vazia — scanner usa todos os ativos.\n/watch ATIVO para focar."
+        linhas = ["📋 <b>WATCHLIST</b> (scanner focado)\n"]
+        for ativo, criado in rows:
+            linhas.append(f"  • {ativo} ({criado})")
+        linhas.append("\n/unwatch ATIVO para remover")
+        return "\n".join(linhas)
+
+    elif cmd == "/editar":
+        if len(partes) < 4:
+            return "❌ Formato: /editar ID campo valor\nEx: /editar 1 stop 58500"
+        try:
+            trade_id = int(partes[1])
+            campo = partes[2].lower()
+            valor = float(partes[3])
+            err = tg13.editar_trade_nivel(trade_id, campo, valor)
+            if err:
+                return f"❌ {err}"
+            tg13.atualizar_dashboard()
+            return f"✅ Trade #{trade_id} — {campo} → ${valor:g}"
+        except Exception as e:
+            return f"❌ Erro: {e}"
 
     elif cmd == "/trade":
         if len(partes) < 10:
@@ -1970,7 +2061,7 @@ def processar_comando(texto):
         conn_st.close()
         topics_txt = "Topics ON" if tg13.topics_ativos() else "Topics OFF (chat único)"
         return (
-            f"✅ <b>LucSharkTrade v13.0 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade {tg13.VERSION} ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
@@ -2014,6 +2105,11 @@ def loop_monitor_trades():
                 _estado["ultimo_monitor"] = time.time()
         except Exception as e:
             log.error(f"monitorar_trades erro: {e}")
+
+        try:
+            tg13.atualizar_precos_live(buscar_preco_atual)
+        except Exception as e:
+            log.debug(f"precos live: {e}")
 
         try:
             monitorar_alertas_nivel()
@@ -2082,6 +2178,14 @@ def loop_comandos_telegram():
 
             msg   = upd.get("message", {})
             texto = (msg.get("text") or "").strip()
+
+            if msg.get("photo"):
+                try:
+                    tg13.responder_analise(msg)
+                except Exception as e:
+                    log.error(f"analise foto: {e}")
+                continue
+
             if not texto or not texto.startswith("/"):
                 continue
 
@@ -2126,6 +2230,11 @@ def loop_comandos_telegram():
 def main():
     init_db()
     init_exchanges()
+    try:
+        tg13.registrar_menu_comandos()
+        log.info("Menu de comandos Telegram registrado.")
+    except Exception as e:
+        log.warning(f"setMyCommands: {e}")
 
     flask_thread = threading.Thread(target=iniciar_flask, daemon=True)
     flask_thread.start()
@@ -2159,13 +2268,13 @@ def main():
             else "⚠️ <b>Topics OFF</b> — funciona no chat atual. Use /debug_topics em cada tópico."
         )
         enviar_telegram(
-            f"🚀 <b>LucSharkTrade v13.0 ONLINE!</b>\n"
+            f"🚀 <b>LucSharkTrade {tg13.VERSION} ONLINE!</b>\n"
             f"📅 {brt}\n\n"
-            f"📌 Dashboard pinado em Trades\n"
-            f"🔘 Botões: ENTRADA + A1/A2/A3/STOP/FECHAR\n"
-            f"🔔 Alertas com lista interativa\n"
+            f"📌 Dashboard pinado | 💲 Preço ao vivo nos cards\n"
+            f"🔘 ENTRADA + A1/A2/A3 + STOP/FECHAR (2 toques) + EDITAR\n"
+            f"🔔 Alertas interativos | /preco | /watchlist\n"
             f"{topics_txt}\n\n"
-            f"Envie /ajuda para ver os comandos."
+            f"/ajuda — menu | /setup_topics — guia Topics"
             ,
             topic="geral",
         )

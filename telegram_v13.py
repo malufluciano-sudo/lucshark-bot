@@ -12,7 +12,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
-VERSION = "v13.0"
+VERSION = "v13.1"
 OFFSET_BRT = -3
 
 
@@ -54,7 +54,29 @@ CMD_TOPIC = {
     "/bloquear": "geral",
     "/desbloquear": "geral",
     "/blacklist": "geral",
+    "/preco": "geral",
+    "/watch": "scanner",
+    "/unwatch": "scanner",
+    "/watchlist": "scanner",
+    "/editar": "trades",
+    "/setup_topics": "geral",
 }
+
+BOT_COMMANDS = [
+    {"command": "ajuda", "description": "Menu de comandos"},
+    {"command": "trade", "description": "Cadastrar trade monitorado"},
+    {"command": "trades", "description": "Trades abertos"},
+    {"command": "preco", "description": "Preço atual do ativo"},
+    {"command": "alerta", "description": "Alerta de nível ou faixa"},
+    {"command": "alertas", "description": "Listar alertas ativos"},
+    {"command": "scan", "description": "Rodar scanner agora"},
+    {"command": "watchlist", "description": "Ver watchlist"},
+    {"command": "watch", "description": "Adicionar à watchlist"},
+    {"command": "relatorio", "description": "Estatísticas e P&L"},
+    {"command": "status", "description": "Status do bot"},
+    {"command": "debug_topics", "description": "ID do tópico atual"},
+    {"command": "setup_topics", "description": "Guia rápido Topics"},
+]
 
 
 def brt_agora():
@@ -225,8 +247,30 @@ def migrar_db():
                 log.info("DB: coluna trades.%s adicionada", col)
             except Exception as e:
                 log.warning("DB migrate %s: %s", col, e)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            ativo TEXT PRIMARY KEY,
+            criado_em TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
+
+def registrar_menu_comandos():
+    return tg_request("setMyCommands", {"commands": BOT_COMMANDS})
+
+
+def setup_topics_guia() -> str:
+    return (
+        "🗂 <b>GUIA TOPICS v13.1</b>\n\n"
+        "1. Grupo → Topics ON → Save\n"
+        "2. Crie: Geral, Trades, Alertas, Scanner, Relatorios, Analises\n"
+        "3. Bot = admin (fixar mensagens)\n"
+        "4. Em <b>cada</b> tópico: /debug_topics\n"
+        "5. Railway: TELEGRAM_CHAT_ID + TOPIC_GERAL…TOPIC_ANALISES\n\n"
+        "Sem Topics o bot segue no chat atual — nada quebra."
+    )
 
 
 def sistema_get(chave: str):
@@ -306,12 +350,26 @@ def fmt_preco(val) -> str:
     return f"${val:.6g}"
 
 
-def keyboard_trade(trade_id: int, estado: str | None = None):
+def keyboard_trade(trade_id: int, estado: str | None = None, modo: str = "normal"):
     if estado is None:
         row = get_trade(trade_id)
         estado = row[13] if row and len(row) > 13 else "AGUARDANDO"
     if estado == "FECHADO":
         return None
+    if modo == "confirm_stop":
+        return {
+            "inline_keyboard": [[
+                {"text": "🛑 CONFIRMAR STOP", "callback_data": f"t:{trade_id}:SC"},
+                {"text": "❌ Cancelar", "callback_data": f"t:{trade_id}:SX"},
+            ]]
+        }
+    if modo == "confirm_fechar":
+        return {
+            "inline_keyboard": [[
+                {"text": "🔒 CONFIRMAR FECHAR", "callback_data": f"t:{trade_id}:FC"},
+                {"text": "❌ Cancelar", "callback_data": f"t:{trade_id}:FX"},
+            ]]
+        }
     rows = []
     if estado == "AGUARDANDO":
         rows.append([
@@ -327,20 +385,31 @@ def keyboard_trade(trade_id: int, estado: str | None = None):
             {"text": "🛑 STOP", "callback_data": f"t:{trade_id}:STOP"},
             {"text": "🔒 FECHAR", "callback_data": f"t:{trade_id}:FECHAR"},
         ],
+        [
+            {"text": "✏️ EDITAR", "callback_data": f"t:{trade_id}:EDIT"},
+        ],
     ]
     return {"inline_keyboard": rows}
 
 
-def texto_trade_card(row) -> str:
+def texto_trade_card(row, preco_atual=None) -> str:
     tid, ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, resultado, criado = row[:12]
     estado = row[13] if len(row) > 13 else "AGUARDANDO"
     emoji = "🟢" if direcao == "LONG" else "🔴"
     status = resultado if resultado and resultado != "ABERTO" else estado
+    linha_mercado = ""
+    if preco_atual is not None and entrada:
+        if direcao == "LONG":
+            pct = (preco_atual - entrada) / entrada * 100
+        else:
+            pct = (entrada - preco_atual) / entrada * 100
+        linha_mercado = f"\n💲 Mercado: {fmt_preco(preco_atual)} ({pct:+.2f}%)"
     return (
         f"{emoji} <b>TRADE #{tid} — {ativo} {direcao}</b>\n"
         f"📥 Entrada: {fmt_preco(entrada)} | Stop: {fmt_preco(stop)}\n"
         f"🎯 A1: {fmt_preco(a1)} | A2: {fmt_preco(a2)} | A3: {fmt_preco(a3)}\n"
-        f"⏱ {tf_ctx}/{tf_ent} | Status: <b>{status}</b>\n"
+        f"⏱ {tf_ctx}/{tf_ent} | Status: <b>{status}</b>"
+        f"{linha_mercado}\n"
         f"📅 {criado}"
     )
 
@@ -485,6 +554,126 @@ def texto_lista_alertas(niveis, faixas) -> str:
     return "\n".join(linhas)
 
 
+_preco_card_cache: dict[int, float] = {}
+
+
+def watchlist_add(ativo: str):
+    agora = brt_agora().strftime("%Y-%m-%d %H:%M")
+    conn = _db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO watchlist VALUES (?,?)",
+        (ativo.upper(), agora),
+    )
+    conn.commit()
+    conn.close()
+
+
+def watchlist_remove(ativo: str) -> bool:
+    conn = _db()
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlist WHERE ativo=?", (ativo.upper(),))
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+def watchlist_listar():
+    conn = _db()
+    c = conn.cursor()
+    c.execute("SELECT ativo, criado_em FROM watchlist ORDER BY ativo")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def editar_trade_nivel(trade_id: int, campo: str, valor: float) -> str | None:
+    campos = {
+        "entrada": "entrada", "stop": "stop",
+        "a1": "a1", "a2": "a2", "a3": "a3",
+    }
+    col = campos.get(campo.lower())
+    if not col:
+        return f"Campo inválido: {campo}"
+    row = get_trade(trade_id)
+    if not row or (row[10] or "ABERTO") != "ABERTO":
+        return f"Trade #{trade_id} não encontrado ou já fechado."
+    conn = _db()
+    c = conn.cursor()
+    c.execute(f"UPDATE trades SET {col}=? WHERE id=?", (valor, trade_id))
+    conn.commit()
+    conn.close()
+    refresh_trade_card(trade_id)
+    return None
+
+
+def refresh_trade_card(trade_id: int, preco_atual=None):
+    row = get_trade(trade_id)
+    if not row:
+        return
+    msg_id = row[12] if len(row) > 12 else None
+    if not msg_id:
+        return
+    editar(
+        int(msg_id),
+        texto_trade_card(row, preco_atual=preco_atual),
+        topic="trades",
+        keyboard=keyboard_trade(trade_id),
+    )
+
+
+def atualizar_precos_live(buscar_preco_fn):
+    conn = _db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, ativo, entrada, msg_id FROM trades "
+        "WHERE resultado='ABERTO' AND msg_id IS NOT NULL"
+    )
+    rows = c.fetchall()
+    conn.close()
+    for tid, ativo, entrada, msg_id in rows:
+        if not msg_id:
+            continue
+        try:
+            dados = buscar_preco_fn(ativo)
+            if not dados:
+                continue
+            preco = dados.get("preco")
+            if preco is None:
+                continue
+            if _preco_card_cache.get(tid) == preco:
+                continue
+            _preco_card_cache[tid] = preco
+            refresh_trade_card(tid, preco_atual=preco)
+        except Exception as e:
+            log.debug("preco live #%s: %s", tid, e)
+
+
+def responder_analise(msg: dict):
+    """Topic Análises — acolhe prints com checklist Wyckoff."""
+    msg_id = msg.get("message_id")
+    caption = msg.get("caption") or ""
+    texto = (
+        "🧠 <b>ANÁLISE RECEBIDA</b>\n\n"
+        "Checklist Wyckoff:\n"
+        "1. Lateralização com S/R?\n"
+        "2. Tuk Tuk completo (≥3 candles + vol crescente)?\n"
+        "3. Breakout com volume alto?\n\n"
+        "Se as 3 = SIM → entrada na direção do rompimento.\n"
+        "Use /trade para cadastrar se o setup fechar."
+    )
+    if caption:
+        texto = f"📝 <i>{caption[:200]}</i>\n\n" + texto
+    enviar(texto, topic="analises", reply_to=msg_id)
+
+
+def enviar_sinal_externo(mensagem: str, tipo: str = "scanner", prioridade: bool = False):
+    prefix = "🚨 " if prioridade else ""
+    topic = "scanner" if tipo == "scanner" else "geral"
+    return enviar(f"{prefix}{mensagem}", topic=topic)
+
+
 def _marcar_entrada(trade_id: int):
     row = get_trade(trade_id)
     if not row:
@@ -534,6 +723,8 @@ def processar_callback(data: str, callback_id: str, user_ok: bool = True):
             answer_callback(callback_id, f"Trade #{trade_id} não está aberto.")
             return None
 
+        msg_id = row[12] if len(row) > 12 else None
+
         if acao == "ENTRADA":
             estado_atual = row[13] if len(row) > 13 else "AGUARDANDO"
             if estado_atual != "AGUARDANDO":
@@ -555,19 +746,80 @@ def processar_callback(data: str, callback_id: str, user_ok: bool = True):
             answer_callback(callback_id, f"Entrada #{trade_id} confirmada!")
             return None
 
+        if acao == "EDIT":
+            enviar(
+                (
+                    f"✏️ <b>Editar trade #{trade_id}</b>\n\n"
+                    f"/editar {trade_id} entrada VALOR\n"
+                    f"/editar {trade_id} stop VALOR\n"
+                    f"/editar {trade_id} a1 VALOR\n"
+                    f"/editar {trade_id} a2 VALOR\n"
+                    f"/editar {trade_id} a3 VALOR"
+                ),
+                topic="trades",
+                reply_to=msg_id,
+            )
+            answer_callback(callback_id, "Comandos de edição enviados.")
+            return None
+
+        if acao == "STOP":
+            if msg_id:
+                editar(
+                    int(msg_id),
+                    texto_trade_card(row),
+                    topic="trades",
+                    keyboard=keyboard_trade(trade_id, modo="confirm_stop"),
+                )
+            answer_callback(callback_id, "Confirme o STOP.")
+            return None
+
+        if acao == "FECHAR":
+            if msg_id:
+                editar(
+                    int(msg_id),
+                    texto_trade_card(row),
+                    topic="trades",
+                    keyboard=keyboard_trade(trade_id, modo="confirm_fechar"),
+                )
+            answer_callback(callback_id, "Confirme o FECHAR.")
+            return None
+
+        if acao == "SX":
+            if msg_id:
+                editar(
+                    int(msg_id),
+                    texto_trade_card(row),
+                    topic="trades",
+                    keyboard=keyboard_trade(trade_id),
+                )
+            answer_callback(callback_id, "STOP cancelado.")
+            return None
+
+        if acao == "FX":
+            if msg_id:
+                editar(
+                    int(msg_id),
+                    texto_trade_card(row),
+                    topic="trades",
+                    keyboard=keyboard_trade(trade_id),
+                )
+            answer_callback(callback_id, "FECHAR cancelado.")
+            return None
+
         mapa = {
             "A1": "WIN_A1",
             "A2": "WIN_A2",
             "A3": "WIN_A3",
-            "STOP": "LOSS",
-            "FECHAR": "BREAKEVEN",
+            "SC": "LOSS",
+            "FC": "BREAKEVEN",
         }
         resultado = mapa.get(acao)
         if not resultado:
             answer_callback(callback_id, "Ação desconhecida.")
             return None
         _marcar_trade_fechado(trade_id)
-        fechar_trade_card(trade_id, resultado, nota=f"Confirmado via botão ({acao})")
+        label = "STOP" if acao == "SC" else ("FECHAR" if acao == "FC" else acao)
+        fechar_trade_card(trade_id, resultado, nota=f"Confirmado via botão ({label})")
         answer_callback(callback_id, f"Trade #{trade_id} → {resultado}")
         return f"✅ Trade #{trade_id} atualizado: {resultado}"
 
