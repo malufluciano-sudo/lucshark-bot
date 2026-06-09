@@ -89,6 +89,7 @@ BOT_COMMANDS = [
     {"command": "watch", "description": "Adicionar à watchlist"},
     {"command": "relatorio", "description": "Estatísticas e P&L"},
     {"command": "status", "description": "Status do bot"},
+    {"command": "ping", "description": "Teste se o bot está online"},
     {"command": "debug_topics", "description": "ID do tópico atual"},
     {"command": "setup_topics", "description": "Guia rápido Topics"},
     {"command": "auto_setup", "description": "Criar Topics automaticamente"},
