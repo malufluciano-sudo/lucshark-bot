@@ -1,0 +1,19 @@
+[Unit]
+Description=LucShark Telegram Bot v13
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/lucshark-bot
+EnvironmentFile=/opt/lucshark-bot/.env
+ExecStart=/opt/lucshark-bot/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
