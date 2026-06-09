@@ -1569,7 +1569,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v13.3"})
+    return jsonify({"status": "online", "version": "v13.4"})
 
 
 @flask_app.route("/api/jj/sinal", methods=["POST"])
@@ -2196,26 +2196,25 @@ def loop_comandos_telegram():
 
             cmd_base = texto.split()[0].lower().split("@")[0]
             topic = tg13.topic_for_cmd(cmd_base)
+            chat  = msg.get("chat", {})
+            if chat.get("type") in ("group", "supergroup"):
+                tg13.garantir_topics_grupo(chat["id"])
             log.info(f"Comando recebido: {texto} → topic {topic}")
 
             try:
                 if cmd_base == "/debug_topics":
-                    enviar_telegram(tg13.debug_topics_text(msg), topic="geral")
+                    tg13.responder_comando(msg, tg13.debug_topics_text(msg))
                     continue
 
                 if cmd_base == "/limpar_duplicados":
-                    chat = msg.get("chat", {})
                     if chat.get("type") not in ("group", "supergroup"):
-                        enviar_telegram(
+                        tg13.responder_comando(
+                            msg,
                             "❌ Use /limpar_duplicados no grupo LucShark Trading.",
-                            topic="geral",
                         )
                         continue
-                    resultado = tg13.limpar_topics_duplicados(chat["id"])
-                    tg13.enviar_para_chat(
-                        chat["id"],
-                        resultado,
-                        thread=msg.get("message_thread_id"),
+                    tg13.responder_comando(
+                        msg, tg13.limpar_topics_duplicados(chat["id"])
                     )
                     continue
 
@@ -2256,17 +2255,30 @@ def loop_comandos_telegram():
                 elif resposta == "ALERTAS_LIST":
                     enviar_lista_alertas()
                 elif resposta:
-                    enviar_telegram(resposta, topic=topic)
+                    if chat.get("type") in ("group", "supergroup"):
+                        tg13.responder_comando(msg, resposta)
+                    else:
+                        enviar_telegram(resposta, topic=topic)
             except Exception as e:
                 log.error(f"Erro processando '{texto}': {e}")
                 try:
-                    enviar_telegram(f"⚠️ Erro ao processar {texto}: {e}", topic="geral")
+                    tg13.responder_comando(
+                        msg, f"⚠️ Erro ao processar {texto}: {e}"
+                    ) if chat.get("type") in ("group", "supergroup") else enviar_telegram(
+                        f"⚠️ Erro ao processar {texto}: {e}", topic="geral"
+                    )
                 except Exception:
                     pass
 
 def main():
     init_db()
     tg13.carregar_topics_persistidos()
+    grp = os.environ.get("TELEGRAM_GROUP_ID", "") or tg13._chat_id_persistido()
+    if grp:
+        try:
+            tg13.garantir_topics_grupo(int(grp))
+        except Exception as e:
+            log.warning(f"rediscover startup: {e}")
     init_exchanges()
     try:
         tg13.registrar_menu_comandos()

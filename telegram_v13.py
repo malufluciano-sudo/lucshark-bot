@@ -12,7 +12,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
-VERSION = "v13.3"
+VERSION = "v13.4"
 OFFSET_BRT = -3
 
 TOPIC_PLAN = [
@@ -117,6 +117,56 @@ def carregar_topics_persistidos():
                 TOPICS[key] = int(db_val)
             except ValueError:
                 pass
+
+
+def rediscover_topics(chat_id: int) -> bool:
+    """
+    Reconstrói IDs dos tópicos pelo nome (útil após redeploy Railway).
+    Se houver duplicatas, mantém o tópico com ID maior (criado pelo auto_setup).
+    """
+    todos = _listar_forum_topics_all(chat_id)
+    if not todos:
+        return False
+    encontrados = 0
+    for key, nome in TOPIC_PLAN:
+        aliases = _NOME_ALIASES.get(key, (nome.lower(),))
+        candidatos = [
+            t for t in todos
+            if not t["is_general"] and t["name"].lower() in aliases
+        ]
+        if not candidatos:
+            continue
+        escolhido = max(candidatos, key=lambda x: x["id"])
+        sistema_set(f"topic_{key}", escolhido["id"])
+        TOPICS[key] = escolhido["id"]
+        encontrados += 1
+    if encontrados:
+        sistema_set("telegram_chat_id", str(chat_id))
+        log.info("Topics redescobertos: %s em chat %s", encontrados, chat_id)
+    return encontrados > 0
+
+
+def garantir_topics_grupo(chat_id: int) -> bool:
+    carregar_topics_persistidos()
+    if topics_ativos():
+        return True
+    return rediscover_topics(chat_id)
+
+
+def responder_comando(msg: dict, texto: str, keyboard: dict | None = None):
+    """
+    Responde NO MESMO tópico onde o comando foi enviado.
+    Corrige /status sem resposta quando há 2x Geral.
+    """
+    chat = msg.get("chat", {})
+    cid = chat.get("id")
+    thread = msg.get("message_thread_id")
+    reply = msg.get("message_id")
+    if chat.get("type") in ("group", "supergroup") and cid:
+        return enviar_para_chat(
+            cid, texto, thread=thread, reply_to=reply, keyboard=keyboard
+        )
+    return enviar(texto, topic="geral", reply_to=reply, keyboard=keyboard)
 
 
 def _chat_id_persistido() -> str | None:
@@ -425,6 +475,12 @@ def limpar_topics_duplicados(chat_id: int) -> str:
     Remove tópicos duplicados (ex: 2x Geral, 2x Trades).
     Mantém os IDs salvos pelo /auto_setup. Não apaga # General nativo.
     """
+    if not garantir_topics_grupo(chat_id):
+        return (
+            "❌ Não achei tópicos salvos.\n"
+            "Envie /auto_setup@LucSharkBot ou confira se Topics está ON."
+        )
+
     carregar_topics_persistidos()
     canonical = {}
     for key, _ in TOPIC_PLAN:
@@ -436,10 +492,7 @@ def limpar_topics_duplicados(chat_id: int) -> str:
                 pass
 
     if not canonical:
-        return (
-            "❌ Nenhum tópico canônico salvo.\n"
-            "Envie /auto_setup@LucSharkBot primeiro."
-        )
+        return "❌ Falha ao mapear tópicos. Tente /auto_setup@LucSharkBot."
 
     todos = _listar_forum_topics_all(chat_id)
     por_chave: dict[str, list] = {}
