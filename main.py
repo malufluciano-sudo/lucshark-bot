@@ -1689,7 +1689,7 @@ def processar_comando(texto):
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
             "/fechar ID PRECO [motivo]\n"
             "/trades — lista rápida | Dashboard pinado automático\n"
-            "Botões inline: A1 / A2 / A3 / STOP / FECHAR\n\n"
+            "Botões inline: ENTRADA / A1 / A2 / A3 / STOP / FECHAR\n\n"
             "<b>🔔 ALERTAS</b> (topic Alertas)\n"
             "/alerta ATIVO NIVEL ACIMA|ABAIXO [nota]\n"
             "/alerta ATIVO SUP RES — faixa S/R\n"
@@ -2109,7 +2109,7 @@ def loop_comandos_telegram():
                     tid = int(resposta.split(":")[1])
                     tg13.criar_trade_mae(tid)
                     enviar_telegram(
-                        f"✅ Trade #{tid} no painel com botões A1/A2/A3/STOP/FECHAR.",
+                        f"✅ Trade #{tid} no painel — toque 📥 ENTRADA quando executar.",
                         topic="trades",
                     )
                 elif resposta == "ALERTAS_LIST":
@@ -2162,7 +2162,7 @@ def main():
             f"🚀 <b>LucSharkTrade v13.0 ONLINE!</b>\n"
             f"📅 {brt}\n\n"
             f"📌 Dashboard pinado em Trades\n"
-            f"🔘 Botões inline A1/A2/A3/STOP/FECHAR\n"
+            f"🔘 Botões: ENTRADA + A1/A2/A3/STOP/FECHAR\n"
             f"🔔 Alertas com lista interativa\n"
             f"{topics_txt}\n\n"
             f"Envie /ajuda para ver os comandos."

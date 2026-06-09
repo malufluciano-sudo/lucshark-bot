@@ -306,22 +306,29 @@ def fmt_preco(val) -> str:
     return f"${val:.6g}"
 
 
-def keyboard_trade(trade_id: int, estado: str = "ABERTO"):
+def keyboard_trade(trade_id: int, estado: str | None = None):
+    if estado is None:
+        row = get_trade(trade_id)
+        estado = row[13] if row and len(row) > 13 else "AGUARDANDO"
     if estado == "FECHADO":
         return None
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✅ A1", "callback_data": f"t:{trade_id}:A1"},
-                {"text": "✅ A2", "callback_data": f"t:{trade_id}:A2"},
-                {"text": "✅ A3", "callback_data": f"t:{trade_id}:A3"},
-            ],
-            [
-                {"text": "🛑 STOP", "callback_data": f"t:{trade_id}:STOP"},
-                {"text": "🔒 FECHAR", "callback_data": f"t:{trade_id}:FECHAR"},
-            ],
-        ]
-    }
+    rows = []
+    if estado == "AGUARDANDO":
+        rows.append([
+            {"text": "📥 ENTRADA", "callback_data": f"t:{trade_id}:ENTRADA"},
+        ])
+    rows += [
+        [
+            {"text": "✅ A1", "callback_data": f"t:{trade_id}:A1"},
+            {"text": "✅ A2", "callback_data": f"t:{trade_id}:A2"},
+            {"text": "✅ A3", "callback_data": f"t:{trade_id}:A3"},
+        ],
+        [
+            {"text": "🛑 STOP", "callback_data": f"t:{trade_id}:STOP"},
+            {"text": "🔒 FECHAR", "callback_data": f"t:{trade_id}:FECHAR"},
+        ],
+    ]
+    return {"inline_keyboard": rows}
 
 
 def texto_trade_card(row) -> str:
@@ -478,6 +485,20 @@ def texto_lista_alertas(niveis, faixas) -> str:
     return "\n".join(linhas)
 
 
+def _marcar_entrada(trade_id: int):
+    row = get_trade(trade_id)
+    if not row:
+        return
+    ativo = row[1]
+    chave = f"{trade_id}_{ativo}_entrada"
+    agora = brt_agora().strftime("%Y-%m-%d %H:%M")
+    conn = _db()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO alertas_log VALUES (?,?)", (chave, agora))
+    conn.commit()
+    conn.close()
+
+
 def _marcar_trade_fechado(trade_id: int):
     row = get_trade(trade_id)
     if not row:
@@ -508,6 +529,32 @@ def processar_callback(data: str, callback_id: str, user_ok: bool = True):
             return None
         trade_id = int(parts[1])
         acao = parts[2]
+        row = get_trade(trade_id)
+        if not row or (row[10] or "ABERTO") != "ABERTO":
+            answer_callback(callback_id, f"Trade #{trade_id} não está aberto.")
+            return None
+
+        if acao == "ENTRADA":
+            estado_atual = row[13] if len(row) > 13 else "AGUARDANDO"
+            if estado_atual != "AGUARDANDO":
+                answer_callback(callback_id, f"Entrada já confirmada ({estado_atual}).")
+                return None
+            ativo, direcao, entrada = row[1], row[2], row[3]
+            _marcar_entrada(trade_id)
+            set_trade_estado(trade_id, "ENTRADA")
+            emoji = "🟢" if direcao == "LONG" else "🔴"
+            notify_trade_event(
+                trade_id,
+                (
+                    f"{emoji} <b>ENTRADA CONFIRMADA — #{trade_id}</b>\n"
+                    f"{ativo} {direcao} @ {fmt_preco(entrada)}\n"
+                    f"✅ Posição ativa — monitorando alvos e stop."
+                ),
+                estado="ENTRADA",
+            )
+            answer_callback(callback_id, f"Entrada #{trade_id} confirmada!")
+            return None
+
         mapa = {
             "A1": "WIN_A1",
             "A2": "WIN_A2",
@@ -518,10 +565,6 @@ def processar_callback(data: str, callback_id: str, user_ok: bool = True):
         resultado = mapa.get(acao)
         if not resultado:
             answer_callback(callback_id, "Ação desconhecida.")
-            return None
-        row = get_trade(trade_id)
-        if not row or (row[10] or "ABERTO") != "ABERTO":
-            answer_callback(callback_id, f"Trade #{trade_id} não está aberto.")
             return None
         _marcar_trade_fechado(trade_id)
         fechar_trade_card(trade_id, resultado, nota=f"Confirmado via botão ({acao})")
