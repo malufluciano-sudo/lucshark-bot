@@ -7,6 +7,7 @@ import threading
 import json
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify
+import telegram_v13 as tg13
 
 flask_app = Flask(__name__)
 
@@ -89,6 +90,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    tg13.migrar_db()
 
 def salvar_trade(ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent):
     conn = sqlite3.connect("trades.db")
@@ -144,19 +146,9 @@ def relatorio():
 def brt_agora():
     return datetime.now(timezone(timedelta(hours=OFFSET_BRT)))
 
-def enviar_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram não configurado.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML"
-        }, timeout=10)
-    except Exception as e:
-        log.error(f"Telegram erro: {e}")
+def enviar_telegram(msg, topic="geral", reply_to=None, keyboard=None, pin=False):
+    """Wrapper v13 — roteia mensagens por Topic; compatível com chamadas antigas."""
+    return tg13.enviar(msg, topic=topic, reply_to=reply_to, keyboard=keyboard, pin=pin)
 
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -164,7 +156,7 @@ def get_updates(offset=None):
         "timeout": 25,
         "offset": offset,
         "limit": 10,
-        "allowed_updates": ["message"]
+        "allowed_updates": ["message", "callback_query"]
     }
     try:
         r = requests.get(url, params=params, timeout=30)
@@ -877,10 +869,11 @@ def remover_blacklist(ativo):
 def rodar_scanner():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
     enviar_telegram(
-        f"🔍 <b>SCANNER AGREGADO v12.6</b>\n"
+        f"🔍 <b>SCANNER AGREGADO v13.0</b>\n"
         f"{brt}\n"
         f"Top-Down 1H→15M | Tuk Tuk | VWAP Ancorado\n"
-        f"Analisando ativos..."
+        f"Analisando ativos...",
+        topic="scanner",
     )
     tickers   = buscar_ticker_24h()
     pares_raw = buscar_todos_pares()
@@ -921,7 +914,8 @@ def rodar_scanner():
             f"✅ <b>SCAN CONCLUÍDO</b>\n"
             f"{brt}\n"
             f"Analisados: {n_analisados} ativos\n"
-            f"Nenhum ativo com Tuk Tuk + Bias 1H + Vol ≥5x alinhados."
+            f"Nenhum ativo com Tuk Tuk + Bias 1H + Vol ≥5x alinhados.",
+            topic="scanner",
         )
         return
 
@@ -980,13 +974,13 @@ def rodar_scanner():
 
     mensagem = "\n".join(linhas)
     if len(mensagem) <= 4000:
-        enviar_telegram(mensagem)
+        enviar_telegram(mensagem, topic="scanner")
     else:
         bloco = []
         chars = 0
         for linha in linhas:
             if chars + len(linha) > 3800:
-                enviar_telegram("\n".join(bloco))
+                enviar_telegram("\n".join(bloco), topic="scanner")
                 bloco = [linha]
                 chars = len(linha)
                 time.sleep(1)
@@ -994,13 +988,13 @@ def rodar_scanner():
                 bloco.append(linha)
                 chars += len(linha)
         if bloco:
-            enviar_telegram("\n".join(bloco))
+            enviar_telegram("\n".join(bloco), topic="scanner")
 
     log.info(f"Scanner Agregado: {len(resultados)} setups de {n_analisados} ativos.")
 
 def rodar_scanner_debug():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
-    enviar_telegram(f"🔧 <b>MODO DEBUG</b>\n{brt}\nTestando 5 ativos...")
+    enviar_telegram(f"🔧 <b>MODO DEBUG</b>\n{brt}\nTestando 5 ativos...", topic="geral")
     tickers   = buscar_ticker_24h()
     pares_raw = buscar_todos_pares()
     amostra   = pares_raw[:5] if pares_raw else []
@@ -1016,7 +1010,7 @@ def rodar_scanner_debug():
             msg.append(f"  {symbol}: {'OK ' + str(len(dados)) + ' candles' if ok else 'ERRO: ' + str(dados)[:60]}")
         except Exception as e:
             msg.append(f"  {symbol}: EXCECAO {e}")
-    enviar_telegram("\n".join(msg))
+    enviar_telegram("\n".join(msg), topic="geral")
 
 def normalizar_symbol_ccxt(ativo):
     s = ativo.upper().strip()
@@ -1225,7 +1219,8 @@ def monitorar_alertas_nivel():
                 f"🔔 <b>ALERTA #{aid} ACIONADO</b>\n"
                 f"📊 {ativo} | ${preco:.6g} {seta} ${nivel}{nota_txt}\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"Envie o gráfico para análise completa."
+                f"Envie o gráfico para análise completa.",
+                topic="alertas",
             )
             log.info(f"Alerta #{aid} {ativo} disparado em ${preco:.6g}")
         else:
@@ -1289,13 +1284,11 @@ def monitorar_trades():
                 marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
                 duracao = calcular_duracao(criado)
-                enviar_telegram(
-                    f"🛑 <b>STOP ATINGIDO — {ativo} LONG #{tid}</b>\n"
-                    f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
-                    f"❌ Sair imediatamente!\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📋 Entrada: ${entrada} | Saída: ${preco:.6g}\n"
-                    f"❌ LOSS | ⏱ {duracao}"
+                tg13.fechar_trade_card(
+                    tid, "LOSS",
+                    nota=(
+                        f"🛑 STOP LONG | ${preco:.6g} | ⏱ {duracao}"
+                    ),
                 )
                 _preco_anterior[chave_ant] = preco
                 continue
@@ -1308,43 +1301,33 @@ def monitorar_trades():
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A3")
                     duracao = calcular_duracao(criado)
-                    enviar_telegram(
-                        f"🏆 <b>A3 ATINGIDO — {ativo} LONG #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
-                        f"✅ Realizar 80% | 🎉 Trailing Stop no restante\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
-                        f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
-                    )
+                    tg13.fechar_trade_card(tid, "WIN_A3", nota=f"🏆 A3 LONG | ${preco:.6g} | ⏱ {duracao}")
                 elif nivel_cruzado(preco_ant, preco, a2, "ACIMA") and not alerta_ja_enviado(f"{base}_a2"):
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A2")
-                    enviar_telegram(
-                        f"🎯 <b>A2 ATINGIDO — {ativo} LONG #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
-                        f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
+                    tg13.notify_trade_event(
+                        tid,
+                        f"🎯 <b>A2 LONG #{tid}</b> {ativo} @ ${preco:.6g}",
+                        estado="A2",
                     )
                 elif nivel_cruzado(preco_ant, preco, a1, "ACIMA") and not alerta_ja_enviado(f"{base}_a1"):
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A1")
-                    enviar_telegram(
-                        f"🎯 <b>A1 ATINGIDO — {ativo} LONG #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
-                        f"✅ Realizar 25%\n"
-                        f"🔒 Mover Stop para ${entrada} (breakeven)\n"
-                        f"⏳ Aguardar A2: ${a2}"
+                    tg13.notify_trade_event(
+                        tid,
+                        f"🎯 <b>A1 LONG #{tid}</b> {ativo} @ ${preco:.6g} — breakeven",
+                        estado="A1",
                     )
 
             # ENTRADA: preco cruzou para baixo o nivel de entrada
             if not alerta_ja_enviado(f"{base}_entrada"):
                 if nivel_cruzado(preco_ant, preco, entrada, "ABAIXO"):
                     marcar_alerta(f"{base}_entrada")
-                    enviar_telegram(
-                        f"🟢 <b>ENTRADA LONG ACIONADA — {ativo} #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g} | Nível: ${entrada}\n"
-                        f"📥 Stop: ${stop}\n"
-                        f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
+                    tg13.notify_trade_event(
+                        tid,
+                        f"🟢 <b>ENTRADA LONG #{tid}</b> {ativo} @ ${preco:.6g}",
+                        estado="ENTRADA",
                     )
 
         elif direcao == "SHORT":
@@ -1354,13 +1337,9 @@ def monitorar_trades():
                 marcar_alerta(f"{base}_stop")
                 atualizar_resultado(ativo, "LOSS")
                 duracao = calcular_duracao(criado)
-                enviar_telegram(
-                    f"🛑 <b>STOP ATINGIDO — {ativo} SHORT #{tid}</b>\n"
-                    f"💲 Preço: ${preco:.6g} | Stop: ${stop}\n"
-                    f"❌ Sair imediatamente!\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📋 Entrada: ${entrada} | Saída: ${preco:.6g}\n"
-                    f"❌ LOSS | ⏱ {duracao}"
+                tg13.fechar_trade_card(
+                    tid, "LOSS",
+                    nota=f"🛑 STOP SHORT | ${preco:.6g} | ⏱ {duracao}",
                 )
                 _preco_anterior[chave_ant] = preco
                 continue
@@ -1373,43 +1352,33 @@ def monitorar_trades():
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A3")
                     duracao = calcular_duracao(criado)
-                    enviar_telegram(
-                        f"🏆 <b>A3 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g} | A3: ${a3}\n"
-                        f"✅ Realizar 80% | 🎉 Trailing Stop no restante\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"📋 Entrada: ${entrada} → A1 → A2 → A3\n"
-                        f"✅ WIN A3 (RR 3:1) | ⏱ {duracao}"
-                    )
+                    tg13.fechar_trade_card(tid, "WIN_A3", nota=f"🏆 A3 SHORT | ${preco:.6g} | ⏱ {duracao}")
                 elif nivel_cruzado(preco_ant, preco, a2, "ABAIXO") and not alerta_ja_enviado(f"{base}_a2"):
                     marcar_alerta(f"{base}_a2")
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A2")
-                    enviar_telegram(
-                        f"🎯 <b>A2 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g} | A2: ${a2}\n"
-                        f"✅ Realizar 50% | ⏳ Aguardar A3: ${a3}"
+                    tg13.notify_trade_event(
+                        tid,
+                        f"🎯 <b>A2 SHORT #{tid}</b> {ativo} @ ${preco:.6g}",
+                        estado="A2",
                     )
                 elif nivel_cruzado(preco_ant, preco, a1, "ABAIXO") and not alerta_ja_enviado(f"{base}_a1"):
                     marcar_alerta(f"{base}_a1")
                     atualizar_resultado(ativo, "WIN_A1")
-                    enviar_telegram(
-                        f"🎯 <b>A1 ATINGIDO — {ativo} SHORT #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g} | A1: ${a1}\n"
-                        f"✅ Realizar 25%\n"
-                        f"🔒 Mover Stop para ${entrada} (breakeven)\n"
-                        f"⏳ Aguardar A2: ${a2}"
+                    tg13.notify_trade_event(
+                        tid,
+                        f"🎯 <b>A1 SHORT #{tid}</b> {ativo} @ ${preco:.6g} — breakeven",
+                        estado="A1",
                     )
 
             # ENTRADA: preco cruzou para cima o nivel de entrada
             if not alerta_ja_enviado(f"{base}_entrada"):
                 if nivel_cruzado(preco_ant, preco, entrada, "ACIMA"):
                     marcar_alerta(f"{base}_entrada")
-                    enviar_telegram(
-                        f"🔴 <b>ENTRADA SHORT ACIONADA — {ativo} #{tid}</b>\n"
-                        f"💲 Preço: ${preco:.6g} | Nível: ${entrada}\n"
-                        f"📥 Stop: ${stop}\n"
-                        f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}"
+                    tg13.notify_trade_event(
+                        tid,
+                        f"🔴 <b>ENTRADA SHORT #{tid}</b> {ativo} @ ${preco:.6g}",
+                        estado="ENTRADA",
                     )
 
         # Guardar preco atual para proxima iteracao
@@ -1433,7 +1402,8 @@ def monitorar_trades():
                     f"📍 <b>ALERTA DE PREÇO — {ativo_a}</b>\n"
                     f"🟢 Tocou <b>SUPORTE</b> ${suporte:,.2f}\n"
                     f"Preço atual: ${preco_info['preco']:,.2f}\n"
-                    f"⚠️ Zona de decisão — aguardar confirmação de setup"
+                    f"⚠️ Zona de decisão — aguardar confirmação de setup",
+                    topic="alertas",
                 )
             if high_a >= resistencia * 0.998 and not alerta_ja_enviado(chave_res):
                 marcar_alerta(chave_res)
@@ -1441,7 +1411,8 @@ def monitorar_trades():
                     f"📍 <b>ALERTA DE PREÇO — {ativo_a}</b>\n"
                     f"🔴 Tocou <b>RESISTÊNCIA</b> ${resistencia:,.2f}\n"
                     f"Preço atual: ${preco_info['preco']:,.2f}\n"
-                    f"⚠️ Zona de decisão — aguardar confirmação de setup"
+                    f"⚠️ Zona de decisão — aguardar confirmação de setup",
+                    topic="alertas",
                 )
         except Exception as e:
             log.error(f"Erro monitorando alerta_preco {ativo_a}: {e}")
@@ -1479,7 +1450,8 @@ def relatorio_diario():
         f"✅ Wins: {wins} | ❌ Losses: {loss} | 🔄 Abertos: {abertos}\n"
         f"🎯 Win Rate: {wr:.1f}%\n"
         f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━",
+        topic="relatorios",
     )
 
 def relatorio_semanal():
@@ -1493,7 +1465,10 @@ def relatorio_semanal():
     semana = c.fetchall()
     conn.close()
     if not semana:
-        enviar_telegram(f"📊 <b>Relatório Semanal</b>\n{brt}\nNenhum trade na última semana.")
+        enviar_telegram(
+            f"📊 <b>Relatório Semanal</b>\n{brt}\nNenhum trade na última semana.",
+            topic="relatorios",
+        )
         return
     wins   = [t for t in semana if t[3] and t[3].startswith("WIN")]
     losses = [t for t in semana if t[3] == "LOSS"]
@@ -1528,7 +1503,8 @@ def relatorio_semanal():
         f"<b>DESTAQUES</b>\n"
         f"🏆 Melhor ativo: {melhor} ({contagem.get(melhor,{}).get('w',0)}W/{contagem.get(melhor,{}).get('l',0)}L)\n"
         f"⚠️ Ativo problemático: {pior}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━",
+        topic="relatorios",
     )
 
 @flask_app.route("/api/trades")
@@ -1575,7 +1551,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v12.10"})
+    return jsonify({"status": "online", "version": "v13.0"})
 
 @flask_app.route("/")
 @flask_app.route("/dashboard")
@@ -1689,38 +1665,42 @@ setInterval(loadData,30000);
 </script>
 </body></html>"""
 
+def enviar_lista_alertas():
+    rows_nivel = listar_alertas_nivel()
+    rows_preco = listar_alertas_preco()
+    if not rows_nivel and not rows_preco:
+        enviar_telegram("📭 Nenhum alerta ativo.", topic="alertas")
+        return
+    texto = tg13.texto_lista_alertas(rows_nivel, rows_preco)
+    kb = tg13.keyboard_alertas(rows_nivel, rows_preco)
+    enviar_telegram(texto, topic="alertas", keyboard=kb)
+
+
 def processar_comando(texto):
     partes = texto.strip().split()
     cmd    = partes[0].lower()
 
     if cmd in ["/start", "/ajuda"]:
+        topics_txt = "✅ Topics ativos" if tg13.topics_ativos() else "⚠️ Topics OFF — chat único (configure TOPIC_* no Railway)"
         return (
-            "🤖 <b>LucSharkTrade v12.10 — Comandos</b>\n\n"
-            "<b>📊 TRADES</b>\n"
+            "🤖 <b>LucSharkTrade v13.0 — Comandos</b>\n"
+            f"{topics_txt}\n\n"
+            "<b>📊 TRADES</b> (topic Trades)\n"
             "/trade ATIVO DIR ENTRADA STOP A1 A2 A3 TF_CTX TF_ENT\n"
-            "/resultado ATIVO WIN_A1 | WIN_A2 | WIN_A3 | LOSS\n"
-            "/fechar ID PRECO [motivo] — fechar trade pelo ID\n"
-            "/trades — trades abertos\n"
-            "/relatorio — estatísticas e P&L\n"
-            "/semana — relatório da semana\n\n"
-            "<b>🔔 ALERTAS DE NÍVEL</b>\n"
+            "/fechar ID PRECO [motivo]\n"
+            "/trades — lista rápida | Dashboard pinado automático\n"
+            "Botões inline: A1 / A2 / A3 / STOP / FECHAR\n\n"
+            "<b>🔔 ALERTAS</b> (topic Alertas)\n"
             "/alerta ATIVO NIVEL ACIMA|ABAIXO [nota]\n"
-            "/alertas — alertas ativos\n"
-            "/deletar_alerta ID — remover\n\n"
-            "📍 /alerta ATIVO SUP RES  — faixa suporte/resistência\n"
-            "🗑 /delalerta ATIVO       — remove alerta de faixa\n\n"
-            "<b>🔍 SCANNER</b>\n"
-            "/scan — rodar scanner agora\n"
-            "/ativos — exchanges monitoradas\n\n"
-            "<b>🚫 BLACKLIST</b>\n"
-            "/bloquear ATIVO [motivo]\n"
-            "/desbloquear ATIVO\n"
-            "/blacklist — ver bloqueados\n\n"
-            "<b>⚙️ SISTEMA</b>\n"
-            "/parar — limpar fila\n"
-            "/status — status do bot\n"
-            "/debug — diagnóstico da API\n"
-            "/ajuda — este menu"
+            "/alerta ATIVO SUP RES — faixa S/R\n"
+            "/alertas — lista com botões 🗑\n\n"
+            "<b>🔍 SCANNER</b> (topic Scanner)\n"
+            "/scan — rodar agora\n\n"
+            "<b>📊 RELATÓRIOS</b> (topic Relatórios)\n"
+            "/relatorio | /semana (auto 18h e seg 9h)\n\n"
+            "<b>⚙️ SISTEMA</b> (topic Geral)\n"
+            "/status | /debug | /debug_topics\n"
+            "/parar | /ajuda"
         )
 
     elif cmd == "/trade":
@@ -1732,13 +1712,7 @@ def processar_comando(texto):
             a1, a2, a3     = float(partes[5]), float(partes[6]), float(partes[7])
             tf_ctx, tf_ent = partes[8], partes[9]
             tid = salvar_trade(ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent)
-            return (
-                f"✅ <b>Trade #{tid} cadastrado!</b>\n"
-                f"📊 {ativo} {direcao}\n"
-                f"📥 Entrada: ${entrada} | Stop: ${stop}\n"
-                f"🎯 A1: ${a1} | A2: ${a2} | A3: ${a3}\n"
-                f"⏱ {tf_ctx}/{tf_ent} | 🔄 Monitorando 24/7..."
-            )
+            return f"TRADE_CRIADO:{tid}"
         except Exception as e:
             return f"❌ Erro: {e}"
 
@@ -1783,17 +1757,19 @@ def processar_comando(texto):
             c_f.execute("UPDATE trades SET resultado=? WHERE id=?", (resultado_f, trade_id))
             conn_f.commit()
             conn_f.close()
-            # Marcar alerta de entrada como enviado para evitar reativação
             marcar_alerta(f"{trade_id}_{ativo_f}_entrada")
             duracao_f = calcular_duracao(criado_f)
             sinal_r = "+" if r_obtido >= 0 else ""
+            tg13.fechar_trade_card(
+                trade_id,
+                resultado_f,
+                nota=(
+                    f"Manual | Saída ${exit_price} | {sinal_r}{r_obtido:.2f}R | ⏱ {duracao_f}"
+                ),
+            )
             return (
                 f"🔒 <b>TRADE #{trade_id} FECHADO</b>\n"
-                f"📊 {ativo_f} {dir_f}\n"
-                f"📥 Entrada: ${entrada_f} | Saída: ${exit_price}\n"
-                f"📈 R obtido: {sinal_r}{r_obtido:.2f}R\n"
-                f"✅ Resultado: {resultado_f}\n"
-                f"⏱ Duração: {duracao_f}"
+                f"📊 {ativo_f} {dir_f} → {resultado_f}"
             )
         except Exception as e:
             return f"❌ Erro: {e}"
@@ -1858,27 +1834,7 @@ def processar_comando(texto):
             )
 
     elif cmd == "/alertas":
-        rows_nivel = listar_alertas_nivel()
-        rows_preco = listar_alertas_preco()
-        if not rows_nivel and not rows_preco:
-            return "📭 Nenhum alerta ativo."
-        linhas = []
-        if rows_nivel:
-            linhas.append("🔔 <b>Alertas de Nível</b>")
-            for r in rows_nivel:
-                aid, ativo, nivel, condicao, nota, criado = r
-                seta = "▲" if condicao == "ACIMA" else "▼"
-                linha = f"  #{aid} {ativo} ${nivel} {seta}"
-                if nota:
-                    linha += f" | {nota}"
-                linhas.append(linha)
-            linhas.append("  /deletar_alerta ID — remover\n")
-        if rows_preco:
-            linhas.append("📍 <b>Alertas de Faixa</b>")
-            for (ativo_a, sup, res, criado) in rows_preco:
-                linhas.append(f"  • <b>{ativo_a}</b> — 🟢 ${sup:,.2f} | 🔴 ${res:,.2f}")
-            linhas.append("  /delalerta ATIVO — remover")
-        return "\n".join(linhas)
+        return "ALERTAS_LIST"
 
     elif cmd == "/deletar_alerta":
         if len(partes) < 2:
@@ -2012,14 +1968,16 @@ def processar_comando(texto):
         c_st.execute("SELECT COUNT(*) FROM trades WHERE resultado='ABERTO'")
         n_abertos = c_st.fetchone()[0]
         conn_st.close()
+        topics_txt = "Topics ON" if tg13.topics_ativos() else "Topics OFF (chat único)"
         return (
-            f"✅ <b>LucSharkTrade v12.10 ONLINE</b>\n"
+            f"✅ <b>LucSharkTrade v13.0 ONLINE</b>\n"
             f"🕐 {brt}\n"
             f"📡 Exchanges: {ex_online}/3 online\n"
             f"💰 Capital: ${CAPITAL_INICIAL:,.2f}\n"
             f"🔄 Trades abertos: {n_abertos}\n"
-            f"⏱ Intervalo monitor: {INTERVALO_SEG}s\n"
-            f"🔧 v12.5: intracandle high/low + filtro temporal + alvos pos-entrada"
+            f"📌 Dashboard pinado + botões inline\n"
+            f"🗂 {topics_txt}\n"
+            f"⏱ Monitor: {INTERVALO_SEG}s"
         )
 
     return None
@@ -2088,8 +2046,8 @@ def loop_monitor_trades():
         time.sleep(INTERVALO_SEG)
 
 def loop_comandos_telegram():
-    """Thread principal — processa comandos do Telegram com baixa latência."""
-    log.info("Thread de comandos Telegram iniciada.")
+    """Thread principal — comandos + callbacks inline (v13.0)."""
+    log.info("Thread de comandos Telegram iniciada (v13.0).")
     while True:
         try:
             with _estado_lock:
@@ -2107,35 +2065,62 @@ def loop_comandos_telegram():
             with _estado_lock:
                 _estado["ultimo_offset"] = update_id + 1
 
+            cb = upd.get("callback_query")
+            if cb:
+                data = cb.get("data", "")
+                cid = cb.get("id", "")
+                try:
+                    result = tg13.processar_callback(data, cid)
+                    if result == "ALERTAS_REFRESH":
+                        enviar_lista_alertas()
+                    elif result:
+                        enviar_telegram(result, topic="trades")
+                except Exception as e:
+                    log.error(f"callback erro {data}: {e}")
+                    tg13.answer_callback(cid, f"Erro: {e}")
+                continue
+
             msg   = upd.get("message", {})
-            texto = msg.get("text", "")
+            texto = (msg.get("text") or "").strip()
             if not texto or not texto.startswith("/"):
                 continue
 
-            # FIX v12.5: filtro relaxado — só descarta msgs MUITO antigas (>10min).
-            # Antes era 60s, o que descartava comandos legítimos porque o loop
-            # ficava bloqueado em monitorar_trades() + sleep(30s) na mesma thread.
             msg_date = msg.get("date", 0)
             if msg_date and (time.time() - msg_date) > 600:
                 log.warning(f"Comando MUITO antigo ignorado (>10min): {texto}")
                 continue
 
-            log.info(f"Comando recebido: {texto}")
+            cmd_base = texto.split()[0].lower().split("@")[0]
+            topic = tg13.topic_for_cmd(cmd_base)
+            log.info(f"Comando recebido: {texto} → topic {topic}")
+
             try:
+                if cmd_base == "/debug_topics":
+                    enviar_telegram(tg13.debug_topics_text(msg), topic="geral")
+                    continue
+
                 resposta = processar_comando(texto)
                 if resposta == "SCAN_SOLICITADO":
-                    enviar_telegram("🔍 Scanner iniciado manualmente...")
-                    # roda em thread para não bloquear próximos comandos
+                    enviar_telegram("🔍 Scanner iniciado manualmente...", topic="scanner")
                     threading.Thread(target=rodar_scanner, daemon=True).start()
                 elif resposta == "DEBUG_SOLICITADO":
                     threading.Thread(target=rodar_scanner_debug, daemon=True).start()
+                elif resposta and resposta.startswith("TRADE_CRIADO:"):
+                    tid = int(resposta.split(":")[1])
+                    tg13.criar_trade_mae(tid)
+                    enviar_telegram(
+                        f"✅ Trade #{tid} no painel com botões A1/A2/A3/STOP/FECHAR.",
+                        topic="trades",
+                    )
+                elif resposta == "ALERTAS_LIST":
+                    enviar_lista_alertas()
                 elif resposta:
-                    enviar_telegram(resposta)
+                    enviar_telegram(resposta, topic=topic)
             except Exception as e:
                 log.error(f"Erro processando '{texto}': {e}")
                 try:
-                    enviar_telegram(f"⚠️ Erro ao processar {texto}: {e}")
-                except:
+                    enviar_telegram(f"⚠️ Erro ao processar {texto}: {e}", topic="geral")
+                except Exception:
                     pass
 
 def main():
@@ -2168,16 +2153,26 @@ def main():
         enviar_online = True
 
     if enviar_online:
-        enviar_telegram(
-            f"🚀 <b>LucSharkTrade v12.10 ONLINE!</b>\n"
-            f"📅 {brt}\n\n"
-            f"✅ FIX: comandos Telegram agora respondem em &lt;3s\n"
-            f"✅ FIX: monitoramento em thread dedicada\n"
-            f"✅ FIX: filtro de idade de mensagem (60s→600s)\n"
-            f"✅ Monitoramento HIGH/LOW intracandle\n"
-            f"✅ Stop com prioridade máxima\n\n"
-            f"Envie /ajuda para ver os comandos."
+        topics_txt = (
+            "🗂 <b>Topics ativos</b> — mensagens por canal"
+            if tg13.topics_ativos()
+            else "⚠️ <b>Topics OFF</b> — funciona no chat atual. Use /debug_topics em cada tópico."
         )
+        enviar_telegram(
+            f"🚀 <b>LucSharkTrade v13.0 ONLINE!</b>\n"
+            f"📅 {brt}\n\n"
+            f"📌 Dashboard pinado em Trades\n"
+            f"🔘 Botões inline A1/A2/A3/STOP/FECHAR\n"
+            f"🔔 Alertas com lista interativa\n"
+            f"{topics_txt}\n\n"
+            f"Envie /ajuda para ver os comandos."
+            ,
+            topic="geral",
+        )
+        try:
+            tg13.atualizar_dashboard()
+        except Exception as e:
+            log.warning(f"dashboard inicial: {e}")
 
     # FIX v12.5: preserva comandos recentes (<120s) em vez de descartar tudo
     ultimo_offset = None
