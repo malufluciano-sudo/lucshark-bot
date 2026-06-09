@@ -1569,7 +1569,7 @@ def api_stats():
 
 @flask_app.route("/health")
 def health():
-    return jsonify({"status": "online", "version": "v13.1"})
+    return jsonify({"status": "online", "version": "v13.2"})
 
 
 @flask_app.route("/api/jj/sinal", methods=["POST"])
@@ -1733,7 +1733,7 @@ def processar_comando(texto):
             "<b>📊 RELATÓRIOS</b>\n"
             "/relatorio | /semana\n\n"
             "<b>⚙️ SISTEMA</b>\n"
-            "/status | /debug | /debug_topics | /setup_topics\n"
+            "/status | /auto_setup | /setup_topics\n"
             "/parar | /ajuda"
         )
 
@@ -2203,6 +2203,27 @@ def loop_comandos_telegram():
                     enviar_telegram(tg13.debug_topics_text(msg), topic="geral")
                     continue
 
+                if cmd_base == "/auto_setup":
+                    chat = msg.get("chat", {})
+                    if chat.get("type") not in ("group", "supergroup"):
+                        enviar_telegram(
+                            "❌ Abra o grupo <b>LucShark Trading</b> e envie /auto_setup lá.",
+                            topic="geral",
+                        )
+                        continue
+                    resultado = tg13.auto_setup_grupo(chat["id"])
+                    tg13.enviar_para_chat(
+                        chat["id"],
+                        resultado,
+                        thread=msg.get("message_thread_id"),
+                    )
+                    if tg13.topics_ativos():
+                        try:
+                            tg13.atualizar_dashboard()
+                        except Exception:
+                            pass
+                    continue
+
                 resposta = processar_comando(texto)
                 if resposta == "SCAN_SOLICITADO":
                     enviar_telegram("🔍 Scanner iniciado manualmente...", topic="scanner")
@@ -2229,6 +2250,7 @@ def loop_comandos_telegram():
 
 def main():
     init_db()
+    tg13.carregar_topics_persistidos()
     init_exchanges()
     try:
         tg13.registrar_menu_comandos()

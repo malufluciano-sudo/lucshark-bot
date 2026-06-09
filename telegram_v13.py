@@ -12,8 +12,17 @@ import requests
 
 log = logging.getLogger(__name__)
 
-VERSION = "v13.1"
+VERSION = "v13.2"
 OFFSET_BRT = -3
+
+TOPIC_PLAN = [
+    ("geral", "Geral"),
+    ("trades", "Trades"),
+    ("alertas", "Alertas"),
+    ("scanner", "Scanner"),
+    ("relatorios", "Relatorios"),
+    ("analises", "Analises"),
+]
 
 
 def _env_int(key: str, default: int = 0) -> int:
@@ -60,6 +69,7 @@ CMD_TOPIC = {
     "/watchlist": "scanner",
     "/editar": "trades",
     "/setup_topics": "geral",
+    "/auto_setup": "geral",
 }
 
 BOT_COMMANDS = [
@@ -76,7 +86,29 @@ BOT_COMMANDS = [
     {"command": "status", "description": "Status do bot"},
     {"command": "debug_topics", "description": "ID do tópico atual"},
     {"command": "setup_topics", "description": "Guia rápido Topics"},
+    {"command": "auto_setup", "description": "Criar Topics automaticamente"},
 ]
+
+
+def carregar_topics_persistidos():
+    """Carrega chat/tópicos salvos no SQLite (após /auto_setup). Env tem prioridade."""
+    global TOPICS
+    for key, _ in TOPIC_PLAN:
+        env_key = f"TOPIC_{key.upper()}"
+        env_val = _env_int(env_key)
+        if env_val:
+            TOPICS[key] = env_val
+            continue
+        db_val = sistema_get(f"topic_{key}")
+        if db_val:
+            try:
+                TOPICS[key] = int(db_val)
+            except ValueError:
+                pass
+
+
+def _chat_id_persistido() -> str | None:
+    return sistema_get("telegram_chat_id")
 
 
 def brt_agora():
@@ -88,6 +120,9 @@ def _token() -> str:
 
 
 def _chat_id() -> str:
+    persisted = _chat_id_persistido()
+    if persisted:
+        return persisted
     return os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
@@ -114,6 +149,40 @@ def tg_request(method: str, payload: dict):
     except Exception as e:
         log.error("tg %s: %s", method, e)
         return None
+
+
+def enviar_para_chat(
+    chat_id: int | str,
+    msg: str,
+    thread: int | None = None,
+    reply_to: int | None = None,
+    keyboard: dict | None = None,
+    pin: bool = False,
+):
+    """Envia para chat_id explícito (ex: resposta do /auto_setup no grupo)."""
+    payload = {
+        "chat_id": chat_id,
+        "text": msg,
+        "parse_mode": "HTML",
+    }
+    if thread:
+        payload["message_thread_id"] = thread
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    data = tg_request("sendMessage", payload)
+    if not data or not data.get("ok"):
+        return None
+    msg_id = data["result"]["message_id"]
+    if pin:
+        tg_request("pinChatMessage", {
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "disable_notification": True,
+            **({"message_thread_id": thread} if thread else {}),
+        })
+    return msg_id
 
 
 def enviar(
@@ -263,13 +332,128 @@ def registrar_menu_comandos():
 
 def setup_topics_guia() -> str:
     return (
-        "🗂 <b>GUIA TOPICS v13.1</b>\n\n"
-        "1. Grupo → Topics ON → Save\n"
-        "2. Crie: Geral, Trades, Alertas, Scanner, Relatorios, Analises\n"
-        "3. Bot = admin (fixar mensagens)\n"
-        "4. Em <b>cada</b> tópico: /debug_topics\n"
-        "5. Railway: TELEGRAM_CHAT_ID + TOPIC_GERAL…TOPIC_ANALISES\n\n"
-        "Sem Topics o bot segue no chat atual — nada quebra."
+        f"🗂 <b>GUIA TOPICS {VERSION}</b>\n\n"
+        "<b>Automático (recomendado):</b>\n"
+        "1. Grupo → Editar → Topics ON → Save\n"
+        "2. Bot = admin (Gerenciar tópicos + Fixar)\n"
+        "3. No grupo: /auto_setup\n\n"
+        "O bot cria os 6 tópicos e salva os IDs sozinho.\n"
+        "Não precisa configurar Railway manualmente.\n\n"
+        "<b>Manual:</b> /debug_topics em cada tópico + variáveis Railway."
+    )
+
+
+def _bot_user_id() -> int | None:
+    data = tg_request("getMe", {})
+    if data and data.get("ok"):
+        return data["result"]["id"]
+    return None
+
+
+def _listar_forum_topics(chat_id: int) -> dict:
+    """Retorna mapa nome_lower -> message_thread_id."""
+    out = {}
+    offset = 0
+    while True:
+        data = tg_request("getForumTopics", {
+            "chat_id": chat_id,
+            "limit": 100,
+            "offset": offset,
+        })
+        if not data or not data.get("ok"):
+            break
+        batch = data["result"].get("topics", [])
+        for t in batch:
+            name = (t.get("name") or "").strip().lower()
+            tid = t.get("message_thread_id")
+            if name and tid:
+                out[name] = tid
+            if t.get("is_general"):
+                out["geral"] = tid
+        if not data["result"].get("has_more_topics", False):
+            break
+        offset += len(batch)
+    return out
+
+
+def auto_setup_grupo(chat_id: int) -> str:
+    """
+    Cria tópicos via Bot API e persiste IDs no SQLite.
+    Requer: grupo com Topics ON + bot admin (can_manage_topics).
+    """
+    chat_info = tg_request("getChat", {"chat_id": chat_id})
+    if not chat_info or not chat_info.get("ok"):
+        return "❌ Não consegui ler o grupo. O bot está no grupo?"
+
+    chat = chat_info["result"]
+    if not chat.get("is_forum"):
+        return (
+            "❌ <b>Topics ainda não está ativado</b>\n\n"
+            "Só falta 1 coisa manual (30 seg):\n"
+            "1. Toque no nome do grupo\n"
+            "2. Editar → Topics → ligue ON\n"
+            "3. Layout List → <b>Save</b>\n"
+            "4. Envie /auto_setup de novo\n\n"
+            "Eu faço o resto automaticamente."
+        )
+
+    bot_id = _bot_user_id()
+    if not bot_id:
+        return "❌ Token do bot inválido."
+
+    mem = tg_request("getChatMember", {"chat_id": chat_id, "user_id": bot_id})
+    if not mem or not mem.get("ok"):
+        return "❌ Bot não encontrado no grupo. Adicione o bot ao grupo."
+
+    status = mem["result"].get("status", "")
+    if status != "administrator":
+        return (
+            "❌ <b>Bot precisa ser administrador</b>\n\n"
+            "1. Grupo → Administradores → Adicionar admin\n"
+            "2. Selecione o LucSharkTrade\n"
+            "3. Ative: Gerenciar tópicos + Fixar mensagens\n"
+            "4. Envie /auto_setup novamente"
+        )
+
+    perms = mem["result"].get("can_manage_topics", False)
+    can_pin = mem["result"].get("can_pin_messages", False)
+    if not perms:
+        return "❌ Ative a permissão <b>Gerenciar tópicos</b> para o bot."
+
+    existentes = _listar_forum_topics(chat_id)
+    criados = []
+    reutilizados = []
+    linhas_ids = []
+
+    for key, nome in TOPIC_PLAN:
+        nl = nome.lower()
+        thread_id = existentes.get(nl) or existentes.get(key)
+        if not thread_id:
+            resp = tg_request("createForumTopic", {"chat_id": chat_id, "name": nome})
+            if not resp or not resp.get("ok"):
+                desc = (resp or {}).get("description", "erro desconhecido")
+                return f"❌ Erro ao criar tópico <b>{nome}</b>: {desc}"
+            thread_id = resp["result"]["message_thread_id"]
+            criados.append(nome)
+        else:
+            reutilizados.append(nome)
+        sistema_set(f"topic_{key}", thread_id)
+        TOPICS[key] = int(thread_id)
+        linhas_ids.append(f"  {nome}: <code>{thread_id}</code>")
+
+    sistema_set("telegram_chat_id", str(chat_id))
+    carregar_topics_persistidos()
+
+    pin_txt = "✅" if can_pin else "⚠️ ative Fixar mensagens"
+    return (
+        f"✅ <b>TOPICS CONFIGURADOS — {VERSION}</b>\n\n"
+        f"💬 Chat ID: <code>{chat_id}</code>\n"
+        f"📌 Criados: {', '.join(criados) if criados else '—'}\n"
+        f"♻️ Já existiam: {', '.join(reutilizados) if reutilizados else '—'}\n"
+        f"📍 Fixar mensagens: {pin_txt}\n\n"
+        f"<b>Tópicos ativos:</b>\n" + "\n".join(linhas_ids) + "\n\n"
+        f"🗂 <b>Topics ON</b> — mensagens já vão para cada canal.\n"
+        f"Teste: /status no Geral, /trade no Trades."
     )
 
 
