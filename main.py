@@ -160,8 +160,13 @@ def get_updates(offset=None):
     }
     try:
         r = requests.get(url, params=params, timeout=30)
-        return r.json().get("result", [])
-    except:
+        data = r.json()
+        if not data.get("ok"):
+            log.error("getUpdates API: %s", data.get("description", data))
+            return []
+        return data.get("result", [])
+    except Exception as e:
+        log.error("get_updates erro: %s", e)
         return []
 
 LBANK_BASE = "https://api.lbank.info"
