@@ -1725,7 +1725,12 @@ def enviar_lista_alertas():
 
 def processar_comando(texto):
     partes = texto.strip().split()
-    cmd    = partes[0].lower()
+    if not partes:
+        return None
+    partes[0] = partes[0].lower().split("@")[0]
+    for i in range(1, len(partes)):
+        partes[i] = partes[i].split("@")[0]
+    cmd = partes[0]
 
     if cmd in ["/start", "/ajuda"]:
         topics_txt = "✅ Topics ativos" if tg13.topics_ativos() else "⚠️ Topics OFF — chat único (configure TOPIC_* no Railway)"
