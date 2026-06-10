@@ -2,6 +2,8 @@
 
 Guia para leigo. O bot roda na nuvem da Oracle — **sua máquina pode ficar desligada**.
 
+**Migrando do Render?** Leia primeiro: **`MIGRAR_ORACLE.md`** (cutover + parar Render).
+
 Tempo total: ~20–30 minutos (só na primeira vez).
 
 ---
@@ -138,13 +140,14 @@ Deve responder **PONG** e status com **Topics ON**.
 
 ---
 
-## Vantagens vs Railway
+## Vantagens vs Render / Railway
 
-| | Railway | Oracle VM |
-|--|---------|-----------|
-| Custo | Trial acabando | **Grátis forever** (Always Free) |
-| SQLite / tópicos | Some no redeploy | **Persiste no disco** |
-| PC ligado | Não precisa | Não precisa |
+| | Render Free | Railway | Oracle VM |
+|--|-------------|---------|-----------|
+| Custo | $0 | Trial acabou | **Grátis forever** |
+| 24/7 real | Dorme ~15 min | Pago | **Sim** |
+| SQLite / tópicos | Efêmero | Efêmero | **Persiste** |
+| PC ligado | Não | Não | Não |
 
 ---
 

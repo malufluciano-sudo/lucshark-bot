@@ -16,7 +16,7 @@ fi
 echo "=== LucShark Bot — Oracle Cloud setup ==="
 
 apt-get update -qq
-apt-get install -y -qq git python3 python3-pip python3-venv
+apt-get install -y -qq git curl python3 python3-pip python3-venv
 
 if [[ ! -d "$APP_DIR/.git" ]]; then
   echo "Clonando repositório..."
@@ -69,6 +69,13 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
   echo "Logs ao vivo:  sudo journalctl -u lucshark -f"
   echo "Reiniciar:     sudo systemctl restart lucshark"
   echo "Health local:  curl -s http://127.0.0.1:8080/health"
+  echo "Verificação:   sudo bash $APP_DIR/deploy/oracle/verificar.sh"
+  echo ""
+  echo ">>> CUTOVER (Render -> Oracle):"
+  echo "    1) Suspenda/Delete o serviço lucshark-bot no Render"
+  echo "    2) sudo systemctl restart lucshark"
+  echo "    3) /ping@LucSharkBot no Telegram"
+  echo "    Guia completo: MIGRAR_ORACLE.md"
 else
   echo "ERRO: serviço não subiu. Veja: sudo journalctl -u lucshark -n 50"
   exit 1

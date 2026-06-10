@@ -1,5 +1,7 @@
 # LucShark Bot — Deploy no Render
 
+> **Plano B (24/7 grátis):** quando quiser sair do Render Free, use **`MIGRAR_ORACLE.md`**.
+
 ## Correção do build (pandas / Python 3.14)
 
 O bot (`main.py`) **não usa pandas**. Dependências pesadas ficam só em `requirements_dashboard.txt`.
