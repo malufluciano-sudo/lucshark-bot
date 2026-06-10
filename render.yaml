@@ -1,0 +1,13 @@
+# Render — LucShark Bot (web service, polling Telegram 24/7)
+# Variáveis sensíveis (TELEGRAM_TOKEN etc.) ficam no painel Render → Environment.
+services:
+  - type: web
+    name: lucshark-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
