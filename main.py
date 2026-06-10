@@ -162,7 +162,15 @@ def get_updates(offset=None):
         r = requests.get(url, params=params, timeout=30)
         data = r.json()
         if not data.get("ok"):
-            log.error("getUpdates API: %s", data.get("description", data))
+            desc = str(data.get("description", data))
+            log.error("getUpdates API: %s", desc)
+            if "Conflict" in desc or "terminated by other getUpdates" in desc:
+                log.error(
+                    "Duas instancias com o mesmo TELEGRAM_TOKEN — "
+                    "pare Railway/local e deixe so Render (ou vice-versa)."
+                )
+                tg13.deletar_webhook(drop_pending=True)
+                time.sleep(8)
             return []
         return data.get("result", [])
     except Exception as e:

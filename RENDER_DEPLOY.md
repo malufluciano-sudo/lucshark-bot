@@ -40,6 +40,17 @@ LUCSHARK_WEBHOOK_URL=https://SEU-SERVICO.onrender.com/api/jj/sinal
 
 (URL pública do serviço no Render → Settings → URL)
 
+## Erro: `Conflict: terminated by other getUpdates request`
+
+**Duas instâncias** usam o mesmo `TELEGRAM_TOKEN` (ex: Render + Railway).
+
+1. **Railway** → projeto intuição prática → serviço → **Settings → Delete Service** (ou Pause)
+2. **Render** → **Scaling** → confirmar **1 instância**
+3. Seu PC → não rode `python main.py` local com o mesmo token
+4. **Render** → Manual Deploy → aguarde 1 min → `/ping@LucSharkBot`
+
+Só **um** servidor pode rodar o bot por vez.
+
 ## Atenção — plano Free do Render
 
 O plano **Free** pode **dormir** após ~15 min sem tráfego HTTP. Bot com **polling** precisa processo sempre ligado.

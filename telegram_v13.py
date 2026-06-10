@@ -164,14 +164,14 @@ def garantir_topics_grupo(chat_id: int, force: bool = False) -> bool:
     return ok
 
 
-def deletar_webhook():
+def deletar_webhook(drop_pending: bool = False):
     token = _token()
     if not token:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/deleteWebhook",
-            json={"drop_pending_updates": False},
+            json={"drop_pending_updates": drop_pending},
             timeout=10,
         )
     except Exception as e:
