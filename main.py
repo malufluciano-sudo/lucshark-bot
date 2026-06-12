@@ -2272,7 +2272,17 @@ def loop_comandos_telegram():
 
                 resposta = processar_comando(texto)
                 if resposta == "SCAN_SOLICITADO":
-                    enviar_telegram("🔍 Scanner iniciado manualmente...", topic="scanner")
+                    scan_ack = (
+                        "🔍 <b>Scanner iniciado</b>\n"
+                        "Varredura em andamento — pode levar 2–5 min.\n"
+                        "Resultado aparece aqui quando terminar.\n\n"
+                        "💡 <code>/watchlist</code> — ver lista focada\n"
+                        "💡 Lista vazia = varre até 600 pares das exchanges"
+                    )
+                    if chat.get("type") in ("group", "supergroup"):
+                        tg13.responder_comando(msg, scan_ack)
+                    else:
+                        enviar_telegram(scan_ack, topic="scanner")
                     threading.Thread(target=rodar_scanner, daemon=True).start()
                 elif resposta == "DEBUG_SOLICITADO":
                     threading.Thread(target=rodar_scanner_debug, daemon=True).start()

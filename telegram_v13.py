@@ -1066,11 +1066,20 @@ def responder_analise(msg: dict):
         "2. Tuk Tuk completo (≥3 candles + vol crescente)?\n"
         "3. Breakout com volume alto?\n\n"
         "Se as 3 = SIM → entrada na direção do rompimento.\n"
-        "Use /trade para cadastrar se o setup fechar."
+        "Use /trade para cadastrar se o setup fechar.\n\n"
+        "ℹ️ Análise automática de imagem (IA) ainda não está ativa — "
+        "use o Jeova Jireh para leitura completa do gráfico."
     )
     if caption:
         texto = f"📝 <i>{caption[:200]}</i>\n\n" + texto
-    enviar(texto, topic="analises", reply_to=msg_id)
+    chat = msg.get("chat", {})
+    cid = chat.get("id")
+    thread = msg.get("message_thread_id")
+    if chat.get("type") in ("group", "supergroup") and cid:
+        return enviar_para_chat(
+            cid, texto, thread=thread, reply_to=msg_id
+        )
+    return enviar(texto, topic="analises", reply_to=msg_id)
 
 
 def enviar_sinal_externo(mensagem: str, tipo: str = "scanner", prioridade: bool = False):
