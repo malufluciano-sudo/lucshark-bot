@@ -93,7 +93,84 @@ def match_keys_from_db() -> set[str]:
     return keys
 
 
+def _build_market_index(exchanges: list) -> dict[str, list[str]]:
+    """norm_base → ['SYMBOL@exchange', ...]"""
+    idx: dict[str, list[str]] = {}
+    for ex in exchanges:
+        inst = ex.get("instance")
+        if not inst:
+            continue
+        eid = ex["id"]
+        for sym, info in inst.markets.items():
+            if not info.get("active"):
+                continue
+            if not (
+                info.get("swap")
+                or info.get("type") == "swap"
+                or info.get("quote") in ("USDT", "USDC")
+            ):
+                continue
+            if ":USDT" not in sym and "/USDT" not in sym:
+                continue
+            n = _norm_pair(sym)
+            key = f"{sym}@{eid}"
+            if key not in idx.setdefault(n, []):
+                idx[n].append(key)
+    return idx
+
+
+def _pick_preferred(candidates: list[str]) -> str | None:
+    for pref in ("bingx", "binance", "bybit", "lbank"):
+        for c in candidates:
+            if c.endswith(f"@{pref}"):
+                return c
+    return candidates[0] if candidates else None
+
+
+def resolver_pares_watchlist(exchanges: list) -> tuple[list[str], list[str]]:
+    """
+    Resolve cada ativo da watchlist para par ccxt real (prioridade BingX).
+    Retorna (pares_prontos, simbolos_sem_par).
+    """
+    rows = tg13.watchlist_listar()
+    if not rows:
+        return [], []
+
+    idx = _build_market_index(exchanges)
+    items = {it["simbolo"]: it for it in parse_canon_file()}
+    resolved: list[str] = []
+    miss: list[str] = []
+
+    for simbolo, _ in rows:
+        s = simbolo.upper()
+        it = items.get(s, {})
+        bx = it.get("bingx") or BINGX_TRADFI.get(s, "")
+        hit = None
+        candidates: list[str] = []
+
+        if bx:
+            candidates = idx.get(_norm_pair(bx), [])
+        if not candidates:
+            candidates = idx.get(_norm_pair(s), [])
+
+        hit = _pick_preferred(candidates)
+        if hit:
+            resolved.append(hit)
+        else:
+            miss.append(s)
+
+    # dedupe preservando ordem
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for p in resolved:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq, miss
+
+
 def filtrar_pares(pares: list[str]) -> list[str]:
+    """Legado — preferir resolver_pares_watchlist()."""
     keys = match_keys_from_db()
     if not keys:
         return pares

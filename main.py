@@ -895,30 +895,32 @@ def rodar_scanner():
 
 
 def _rodar_scanner_core(brt: str):
+    wl_n = len(tg13.watchlist_listar())
     enviar_scanner_resultado(
         f"🔍 <b>SCANNER AGREGADO {tg13.VERSION}</b>\n"
         f"{brt}\n"
         f"TF: <b>1H</b> (Wyckoff + Tuk Tuk)\n"
-        f"Analisando watchlist..."
+        f"Watchlist: <b>{wl_n}</b> ativos cadastrados..."
     )
-    tickers   = buscar_ticker_24h()
-    pares_raw = buscar_todos_pares()
-
-    # Filtro de volume minimo de mercado
-    pares = []
-    for p in pares_raw:
-        t = tickers.get(p)
-        if t:
-            vol = extrair_volume(t)
-            if vol == 0 or vol >= MIN_VOLUME_24H:
-                pares.append(p)
-        else:
-            pares.append(p)
-    pares = pares[:600]
-
+    miss_wl: list[str] = []
     wl_rows = tg13.watchlist_listar()
     if wl_rows:
-        pares = wl.filtrar_pares(pares)
+        pares, miss_wl = wl.resolver_pares_watchlist(EXCHANGES_CONFIG)
+        if miss_wl:
+            log.warning("Watchlist sem par ccxt: %s", miss_wl)
+    else:
+        tickers   = buscar_ticker_24h()
+        pares_raw = buscar_todos_pares()
+        pares = []
+        for p in pares_raw:
+            t = tickers.get(p)
+            if t:
+                vol = extrair_volume(t)
+                if vol == 0 or vol >= MIN_VOLUME_24H:
+                    pares.append(p)
+            else:
+                pares.append(p)
+        pares = pares[:600]
 
     blacklist  = get_blacklist()
     resultados = []
@@ -940,12 +942,16 @@ def _rodar_scanner_core(brt: str):
     resultados.sort(key=lambda x: x["score"], reverse=True)
 
     if not resultados:
+        miss_txt = ""
+        if miss_wl:
+            miss_txt = f"\n⚠️ Sem par exchange: {len(miss_wl)} ({', '.join(miss_wl[:5])}…)"
         enviar_scanner_resultado(
             f"✅ <b>SCAN CONCLUÍDO</b>\n"
             f"{brt}\n"
-            f"Analisados: <b>{n_analisados}</b> ativos\n"
+            f"Analisados: <b>{n_analisados}</b> de <b>{len(pares)}</b> pares resolvidos\n"
             f"Nenhum setup Wyckoff completo no <b>1H</b> agora.\n"
             f"(Tuk Tuk + lateralização — normal em mercado em tendência)"
+            f"{miss_txt}"
         )
         return
 
@@ -2302,7 +2308,7 @@ def loop_comandos_telegram():
                     _scan_ctx["thread"] = msg.get("message_thread_id")
                     scan_ack = (
                         "🔍 <b>Scanner iniciado</b>\n"
-                        "Varredura em andamento — <b>5–10 min</b> (130 ativos).\n"
+                        "Varredura em andamento — <b>8–15 min</b> (~128 ativos).\n"
                         "Resultado aparece <b>aqui</b> quando terminar."
                     )
                     if chat.get("type") in ("group", "supergroup"):
