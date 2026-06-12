@@ -614,6 +614,8 @@ def analisar_ativo_agregado(symbol):
         "symbol":        symbol.split("@")[0].upper(),
         "preco":         preco,
         "tuk_tuk":       tuk_dir,
+        "bias_1h":       tuk_dir,
+        "vol_rel_15m":   "-",
         "wyckoff":       sinal_wyckoff or "-",
         "range_high":    round(range_high, 6),
         "range_low":     round(range_low,  6),
@@ -883,12 +885,21 @@ def remover_blacklist(ativo):
 
 def rodar_scanner():
     brt = brt_agora().strftime("%d/%m/%Y %H:%M BRT")
-    enviar_telegram(
-        f"🔍 <b>SCANNER AGREGADO v13.0</b>\n"
+    try:
+        _rodar_scanner_core(brt)
+    except Exception as e:
+        log.error("rodar_scanner falhou: %s", e)
+        enviar_scanner_resultado(
+            f"⚠️ <b>Scanner falhou</b>\n{e}\nTente <code>/scan</code> de novo."
+        )
+
+
+def _rodar_scanner_core(brt: str):
+    enviar_scanner_resultado(
+        f"🔍 <b>SCANNER AGREGADO {tg13.VERSION}</b>\n"
         f"{brt}\n"
-        f"Top-Down 1H→15M | Tuk Tuk | VWAP Ancorado\n"
-        f"Analisando ativos...",
-        topic="scanner",
+        f"TF: <b>1H</b> (Wyckoff + Tuk Tuk)\n"
+        f"Analisando watchlist..."
     )
     tickers   = buscar_ticker_24h()
     pares_raw = buscar_todos_pares()
@@ -929,12 +940,12 @@ def rodar_scanner():
     resultados.sort(key=lambda x: x["score"], reverse=True)
 
     if not resultados:
-        enviar_telegram(
+        enviar_scanner_resultado(
             f"✅ <b>SCAN CONCLUÍDO</b>\n"
             f"{brt}\n"
-            f"Analisados: {n_analisados} ativos\n"
-            f"Nenhum ativo com Tuk Tuk + Bias 1H + Vol ≥5x alinhados.",
-            topic="scanner",
+            f"Analisados: <b>{n_analisados}</b> ativos\n"
+            f"Nenhum setup Wyckoff completo no <b>1H</b> agora.\n"
+            f"(Tuk Tuk + lateralização — normal em mercado em tendência)"
         )
         return
 
@@ -1004,13 +1015,13 @@ def rodar_scanner():
 
     mensagem = "\n".join(linhas)
     if len(mensagem) <= 4000:
-        enviar_telegram(mensagem, topic="scanner")
+        enviar_scanner_resultado(mensagem)
     else:
         bloco = []
         chars = 0
         for linha in linhas:
             if chars + len(linha) > 3800:
-                enviar_telegram("\n".join(bloco), topic="scanner")
+                enviar_scanner_resultado("\n".join(bloco))
                 bloco = [linha]
                 chars = len(linha)
                 time.sleep(1)
@@ -1018,7 +1029,7 @@ def rodar_scanner():
                 bloco.append(linha)
                 chars += len(linha)
         if bloco:
-            enviar_telegram("\n".join(bloco), topic="scanner")
+            enviar_scanner_resultado("\n".join(bloco))
 
     log.info(f"Scanner Agregado: {len(resultados)} setups de {n_analisados} ativos.")
 
@@ -2116,7 +2127,18 @@ _estado = {
     "ultimo_relatorio_dia":  None,
     "ultimo_relatorio_sem":  None,
 }
+_scan_ctx = {"chat_id": None, "thread": None}
 _estado_lock = threading.Lock()
+
+
+def enviar_scanner_resultado(msg: str):
+    """Posta resultado do /scan no mesmo tópico onde o comando foi enviado."""
+    cid = _scan_ctx.get("chat_id")
+    thread = _scan_ctx.get("thread")
+    if cid:
+        tg13.enviar_para_chat(cid, msg, thread=thread)
+    else:
+        enviar_telegram(msg, topic="scanner")
 
 def loop_monitor_trades():
     """Thread dedicada para monitorar trades abertos. Não bloqueia o Telegram."""
@@ -2276,17 +2298,17 @@ def loop_comandos_telegram():
 
                 resposta = processar_comando(texto)
                 if resposta == "SCAN_SOLICITADO":
+                    _scan_ctx["chat_id"] = chat.get("id")
+                    _scan_ctx["thread"] = msg.get("message_thread_id")
                     scan_ack = (
                         "🔍 <b>Scanner iniciado</b>\n"
-                        "Varredura em andamento — pode levar 2–5 min.\n"
-                        "Resultado aparece aqui quando terminar.\n\n"
-                        "💡 <code>/watchlist</code> — ver lista focada\n"
-                        "💡 Lista vazia = varre até 600 pares das exchanges"
+                        "Varredura em andamento — <b>5–10 min</b> (130 ativos).\n"
+                        "Resultado aparece <b>aqui</b> quando terminar."
                     )
                     if chat.get("type") in ("group", "supergroup"):
                         tg13.responder_comando(msg, scan_ack)
                     else:
-                        enviar_telegram(scan_ack, topic="scanner")
+                        enviar_scanner_resultado(scan_ack)
                     threading.Thread(target=rodar_scanner, daemon=True).start()
                 elif resposta == "DEBUG_SOLICITADO":
                     threading.Thread(target=rodar_scanner_debug, daemon=True).start()
