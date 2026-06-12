@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
 import telegram_v13 as tg13
+import watchlist_loader as wl
 
 flask_app = Flask(__name__)
 
@@ -180,6 +181,7 @@ def get_updates(offset=None):
 LBANK_BASE = "https://api.lbank.info"
 
 EXCHANGES_CONFIG = [
+    {"id": "bingx",   "label": "BingX",   "instance": None},
     {"id": "lbank",   "label": "LBank",   "instance": None},
     {"id": "binance", "label": "Binance", "instance": None},
     {"id": "bybit",   "label": "Bybit",   "instance": None},
@@ -905,10 +907,7 @@ def rodar_scanner():
 
     wl_rows = tg13.watchlist_listar()
     if wl_rows:
-        def _norm(s):
-            return s.upper().replace("/", "").replace("-", "").replace("_", "")
-        wl_norm = {_norm(a) for a, _ in wl_rows}
-        pares = [p for p in pares if _norm(p) in wl_norm]
+        pares = wl.filtrar_pares(pares)
 
     blacklist  = get_blacklist()
     resultados = []
@@ -1745,7 +1744,8 @@ def processar_comando(texto):
             "<b>🔔 ALERTAS</b>\n"
             "/alerta … | /alertas\n\n"
             "<b>🔍 SCANNER</b>\n"
-            "/scan | /watch ATIVO | /unwatch ATIVO | /watchlist\n\n"
+            "/scan | /watchlist | /reload_watchlist\n"
+            "/watch ATIVO | /unwatch ATIVO\n\n"
             "<b>📈 MERCADO</b>\n"
             "/preco ATIVO\n\n"
             "<b>📊 RELATÓRIOS</b>\n"
@@ -1788,14 +1788,18 @@ def processar_comando(texto):
         return f"⚠️ {ativo} não estava na watchlist."
 
     elif cmd == "/watchlist":
-        rows = tg13.watchlist_listar()
-        if not rows:
-            return "📋 Watchlist vazia — scanner usa todos os ativos.\n/watch ATIVO para focar."
-        linhas = ["📋 <b>WATCHLIST</b> (scanner focado)\n"]
-        for ativo, criado in rows:
-            linhas.append(f"  • {ativo} ({criado})")
-        linhas.append("\n/unwatch ATIVO para remover")
-        return "\n".join(linhas)
+        return wl.resumo_watchlist()
+
+    elif cmd == "/reload_watchlist":
+        total, por_cat = wl.seed_watchlist(force=True)
+        if not total:
+            return "❌ Arquivo dados/watchlist_canon.txt não encontrado ou vazio."
+        det = " | ".join(f"{k}: {v}" for k, v in sorted(por_cat.items()))
+        return (
+            f"✅ <b>Watchlist recarregada</b> — {total} ativos\n"
+            f"{det}\n\n"
+            f"🔍 Use <code>/scan</code> no tópico Scanner."
+        )
 
     elif cmd == "/editar":
         if len(partes) < 4:
@@ -2322,6 +2326,13 @@ def loop_comandos_telegram():
 
 def main():
     init_db()
+    tg13.migrar_db()
+    try:
+        n_wl, _ = wl.seed_watchlist(force=False)
+        if n_wl:
+            log.info("Watchlist canônica: %d ativos prontos.", n_wl)
+    except Exception as e:
+        log.warning("seed watchlist: %s", e)
     tg13.deletar_webhook()
     tg13.carregar_topics_persistidos()
     grp = os.environ.get("TELEGRAM_GROUP_ID", "") or tg13._chat_id_persistido()
