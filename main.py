@@ -1287,7 +1287,7 @@ def monitorar_trades():
     agora_brt = brt_agora()
 
     for trade in abertos:
-        tid, ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, resultado, criado = trade
+        tid, ativo, direcao, entrada, stop, a1, a2, a3, tf_ctx, tf_ent, resultado, criado = trade[:12]
 
         # Filtro temporal: ignorar nos primeiros 120s apos cadastro
         try:
@@ -1960,7 +1960,8 @@ def processar_comando(texto):
             return "📭 Nenhum trade registrado."
         linhas = ["📊 <b>Últimos Trades</b>\n"]
         for r in rows:
-            tid, ativo, direcao, entrada, stop, a1, a2, a3, _, _, resultado, criado = r
+            tid, ativo, direcao, entrada = r[0], r[1], r[2], r[3]
+            resultado, criado = r[10], r[11]
             emoji = "🟢" if direcao == "LONG" else "🔴"
             linhas.append(f"{emoji} #{tid} {ativo} {direcao} ${entrada} → {resultado or 'ABERTO'} ({criado})")
         return "\n".join(linhas)
@@ -2277,11 +2278,20 @@ def loop_comandos_telegram():
                     threading.Thread(target=rodar_scanner_debug, daemon=True).start()
                 elif resposta and resposta.startswith("TRADE_CRIADO:"):
                     tid = int(resposta.split(":")[1])
-                    tg13.criar_trade_mae(tid)
-                    enviar_telegram(
-                        f"✅ Trade #{tid} no painel — toque 📥 ENTRADA quando executar.",
-                        topic="trades",
-                    )
+                    cid = chat.get("id")
+                    thread = msg.get("message_thread_id")
+                    if chat.get("type") in ("group", "supergroup"):
+                        tg13.criar_trade_mae(tid, chat_id=cid, thread=thread)
+                        tg13.responder_comando(
+                            msg,
+                            f"✅ Trade #{tid} cadastrado — toque 📥 ENTRADA quando executar.",
+                        )
+                    else:
+                        tg13.criar_trade_mae(tid)
+                        enviar_telegram(
+                            f"✅ Trade #{tid} no painel — toque 📥 ENTRADA quando executar.",
+                            topic="trades",
+                        )
                 elif resposta == "ALERTAS_LIST":
                     enviar_lista_alertas()
                 elif resposta:

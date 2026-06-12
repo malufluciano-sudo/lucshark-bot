@@ -851,13 +851,19 @@ def atualizar_dashboard():
         sistema_set("dashboard_pin_msg_id", msg_id)
 
 
-def criar_trade_mae(trade_id: int):
+def criar_trade_mae(trade_id: int, chat_id=None, thread=None):
     row = get_trade(trade_id)
     if not row:
         return
     texto = texto_trade_card(row)
     kb = keyboard_trade(trade_id)
-    msg_id = enviar(texto, topic="trades", keyboard=kb)
+    msg_id = None
+    if chat_id:
+        msg_id = enviar_para_chat(
+            chat_id, texto, thread=thread, keyboard=kb
+        )
+    if not msg_id:
+        msg_id = enviar(texto, topic="trades", keyboard=kb)
     if msg_id:
         set_trade_msg(trade_id, msg_id, "AGUARDANDO")
     atualizar_dashboard()
